@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#1d3557"/>
+  <path d="M32 7 L39 14 L32 21 L25 14 Z" fill="#c49a06"/>
+  <text x="32" y="50" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="25" font-weight="700" fill="#ffffff">tai</text>
+</svg>

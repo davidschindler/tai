@@ -1,0 +1,201 @@
+{
+  "name": "tai-vscode",
+  "displayName": "tai — Tilburg.ai agent",
+  "description": "Chat with tai, your Tilburg.ai coding and research agent, right inside VS Code: edits with diffs, approvals, sub-agents, web search, sessions and checkpoints.",
+  "version": "1.0.0",
+  "publisher": "davidschindler",
+  "license": "UNLICENSED",
+  "private": true,
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "tai",
+    "tilburg",
+    "ai",
+    "agent",
+    "chat"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onWebviewPanel:taiChatPanel"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tai-sidebar",
+          "title": "tai",
+          "icon": "media/tai-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "tai-sidebar": [
+        {
+          "type": "webview",
+          "id": "tai.chatView",
+          "name": "tai",
+          "icon": "media/tai-activity.svg"
+        }
+      ]
+    },
+    "commands": [
+      { "command": "tai.focus", "title": "Focus Chat Input", "category": "tai" },
+      { "command": "tai.blur", "title": "Return to Editor", "category": "tai" },
+      { "command": "tai.openSidebar", "title": "Open in Side Bar", "category": "tai", "icon": "$(layout-sidebar-left)" },
+      { "command": "tai.openInNewTab", "title": "Open in New Tab", "category": "tai", "icon": "$(link-external)" },
+      { "command": "tai.newConversation", "title": "New Conversation", "category": "tai", "icon": "$(add)" },
+      { "command": "tai.history", "title": "Conversation History", "category": "tai", "icon": "$(history)" },
+      { "command": "tai.selectModel", "title": "Select Model", "category": "tai" },
+      { "command": "tai.cycleMode", "title": "Cycle Permission Mode", "category": "tai" },
+      { "command": "tai.insertAtMention", "title": "Insert @-Mention of Selection", "category": "tai" },
+      { "command": "tai.addFileToChat", "title": "Add to tai Chat", "category": "tai" },
+      { "command": "tai.openInTerminal", "title": "Open in Terminal", "category": "tai", "icon": "$(terminal)" },
+      { "command": "tai.setApiKey", "title": "Set Tilburg.ai API Key", "category": "tai" },
+      { "command": "tai.acceptDiff", "title": "Accept tai's Change", "category": "tai", "icon": "$(check)" },
+      { "command": "tai.rejectDiff", "title": "Reject tai's Change", "category": "tai", "icon": "$(close)" },
+      { "command": "tai.exportConversation", "title": "Export Conversation as Markdown", "category": "tai" },
+      { "command": "tai.restart", "title": "Restart tai", "category": "tai" },
+      { "command": "tai.stop", "title": "Stop", "category": "tai" },
+      { "command": "tai.showLogs", "title": "Show Logs", "category": "tai" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "tai.newConversation", "when": "view == tai.chatView", "group": "navigation@1" },
+        { "command": "tai.history", "when": "view == tai.chatView", "group": "navigation@2" },
+        { "command": "tai.openInNewTab", "when": "view == tai.chatView", "group": "navigation@3" },
+        { "command": "tai.openInTerminal", "when": "view == tai.chatView", "group": "overflow@1" },
+        { "command": "tai.exportConversation", "when": "view == tai.chatView", "group": "overflow@2" },
+        { "command": "tai.restart", "when": "view == tai.chatView", "group": "overflow@3" },
+        { "command": "tai.showLogs", "when": "view == tai.chatView", "group": "overflow@4" }
+      ],
+      "editor/title": [
+        { "command": "tai.acceptDiff", "when": "resourceScheme == tai-proposed", "group": "navigation@1" },
+        { "command": "tai.rejectDiff", "when": "resourceScheme == tai-proposed", "group": "navigation@2" },
+        { "command": "tai.openInNewTab", "when": "config.tai.showEditorTitleButton && !(resourceScheme == tai-proposed)", "group": "navigation@100" }
+      ],
+      "editor/context": [
+        { "command": "tai.insertAtMention", "when": "editorTextFocus", "group": "tai@1" }
+      ],
+      "explorer/context": [
+        { "command": "tai.addFileToChat", "group": "tai@1" }
+      ],
+      "commandPalette": [
+        { "command": "tai.acceptDiff", "when": "resourceScheme == tai-proposed" },
+        { "command": "tai.rejectDiff", "when": "resourceScheme == tai-proposed" },
+        { "command": "tai.addFileToChat", "when": "false" }
+      ]
+    },
+    "keybindings": [
+      { "command": "tai.focus", "key": "ctrl+escape", "mac": "cmd+escape", "when": "!taiChatFocused" },
+      { "command": "tai.blur", "key": "ctrl+escape", "mac": "cmd+escape", "when": "taiChatFocused" },
+      { "command": "tai.openInNewTab", "key": "ctrl+shift+escape", "mac": "cmd+shift+escape" },
+      { "command": "tai.insertAtMention", "key": "alt+k", "when": "editorTextFocus" },
+      { "command": "tai.newConversation", "key": "ctrl+n", "mac": "cmd+n", "when": "taiChatFocused" },
+      { "command": "tai.acceptDiff", "key": "ctrl+enter", "mac": "cmd+enter", "when": "resourceScheme == tai-proposed" },
+      { "command": "tai.rejectDiff", "key": "ctrl+backspace", "mac": "cmd+backspace", "when": "resourceScheme == tai-proposed" }
+    ],
+    "configuration": {
+      "title": "tai",
+      "properties": {
+        "tai.executablePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `tai` program. Empty: look on `PATH`, then `~/.local/bin/tai`."
+        },
+        "tai.pythonPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Python interpreter used to run `tai`. Empty: run `tai` directly (its `#!` line decides)."
+        },
+        "tai.model": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model for new conversations. Empty: tai's default (`$TAI_MODEL`, or `gpt-5.6-sol`)."
+        },
+        "tai.initialPermissionMode": {
+          "type": "string",
+          "enum": ["manual", "accept-edits", "auto"],
+          "enumDescriptions": [
+            "Ask before file edits, commands and web fetches",
+            "File edits run without asking; commands and fetches ask",
+            "Edits, commands and fetches run without asking (secret files still ask)"
+          ],
+          "default": "manual",
+          "description": "Permission mode for new conversations."
+        },
+        "tai.environmentVariables": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "default": {},
+          "markdownDescription": "Extra environment variables for tai, e.g. `{\"TAI_SEARCH_MODEL\": \"gpt-5.4-mini\"}`."
+        },
+        "tai.useCtrlEnterToSend": {
+          "type": "boolean",
+          "default": false,
+          "description": "Send with Ctrl/Cmd+Enter; Enter inserts a new line."
+        },
+        "tai.attachOpenFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Tell tai which file is open in the editor and what is selected (shown in the message box, can be switched off per message)."
+        },
+        "tai.autoOpenDiff": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open a side-by-side diff in the editor when tai asks to change a file."
+        },
+        "tai.autosave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Save a file with unsaved changes before tai reads or edits it."
+        },
+        "tai.showMessageTimestamps": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show when each message was sent."
+        },
+        "tai.showEditorTitleButton": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show a button in the editor title bar that opens tai in a new tab."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc -p . --noEmit && tsc -p webview --noEmit",
+    "test:python": "cd test/python && python3 -m pytest -q -p no:cacheprovider",
+    "test:webview": "node test/webview/run.mjs",
+    "test:vscode": "node test/vscode/run.mjs",
+    "test": "npm run typecheck && npm run build && npm run test:python && npm run test:webview && npm run test:vscode",
+    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository --skip-license"
+  },
+  "devDependencies": {
+    "@types/diff": "^5.2.3",
+    "@types/dompurify": "^3.0.5",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.17.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.6.0",
+    "diff": "^5.2.0",
+    "dompurify": "^3.2.6",
+    "esbuild": "^0.25.0",
+    "highlight.js": "^11.11.1",
+    "marked": "^15.0.12",
+    "mocha": "^11.7.1",
+    "puppeteer-core": "^24.10.0",
+    "typescript": "^5.8.3"
+  }
+}
