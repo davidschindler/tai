@@ -181,3 +181,21 @@ def test_state_dir_default_per_os(tmp_path):
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env).stdout.strip()
     want = (tmp_path / "AppData" / "Local" / "tai") if WINDOWS else (tmp_path / ".local" / "state" / "tai")
     assert Path(out) == want
+
+
+def test_shell_works_when_tai_has_no_console(api, tmp_path):
+    """VS Code starts tai without a console (Windows: CREATE_NO_WINDOW; elsewhere: no terminal).
+    Commands must still run, exit 0 and return their output, without popping up windows."""
+    from conftest import Client
+    kw = ({"creationflags": subprocess.CREATE_NO_WINDOW} if WINDOWS else {"start_new_session": True})
+    c = Client(api, tmp_path, popen_kw=kw)
+    try:
+        init(c, mode="auto")
+        _, end, m = c.send(mock({"tools": [{"name": SHELL, "args": {"command": "echo one"}}]},
+                                {"tools": [{"name": SHELL, "args": {"command": "echo twø"}}]}, {"text": "k"}))
+        outs = [e for e in c.of("tool_end", m)]
+        assert [e["error"] for e in outs] == [False, False], outs
+        assert "one" in outs[0]["output"] and "twø" in outs[1]["output"], outs
+        assert all("[exit code 0]" in e["output"] for e in outs), outs
+    finally:
+        c.close()

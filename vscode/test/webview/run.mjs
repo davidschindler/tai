@@ -151,7 +151,7 @@ describe("webview", { concurrency: false }, () => {
     await h.page.click(".approval .opt:nth-child(2)");
     await h.waitIdle();
     assert.equal(h.toHost.filter((m) => m.type === "approve").length, 1);
-    assert.equal((await h.page.$$(".tool.ok")).length, 2);
+    assert.equal((await h.page.$$(".tool.ok")).length, 2, (await h.text(".tool")).join(" | "));
     await done(h);
   });
 

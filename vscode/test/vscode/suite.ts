@@ -366,7 +366,7 @@ describe("tai extension", function () {
     await vscode.commands.executeCommand("tai.acceptDiff");
     await pb.turnEnd(mb);
     assert.strictEqual(fs.readFileSync(path.join(WS, "same.txt"), "utf8"), "FROM_TAB\n");
-    assert.strictEqual(diffTabs().length, 1, "the side bar's diff is still open");
+    await until(() => diffTabs().length === 1, 5000, "only the side bar's diff still open");
     await probe.webview({ type: "approve", requestId: apA.requestId, decision: "yes" });
     const endA = await probe.turnEnd(ma);
     assert.strictEqual(endA.reason, "done");

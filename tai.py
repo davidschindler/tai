@@ -63,6 +63,9 @@ def _state_dir():
 
 STATE_DIR = _state_dir()
 KEY_FILE = STATE_DIR / "api_key"           # written by `tai --set-key`
+# Windows: helper programs get a hidden console of their own. Without this, when tai itself runs
+# without a console (started by VS Code), every command would pop up a console window.
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if WINDOWS else {}
 LAST_CONV = STATE_DIR / "last.json"
 HISTORY = STATE_DIR / "history"
 
@@ -551,10 +554,11 @@ def resolve(p):
 
 def show_path(path):
     cwd = Path.cwd()
-    for base in (cwd, cwd.resolve()):     # resolve() expands Windows short names (RUNNER~1) and links
+    # resolve() expands links (macOS /var → /private/var) and Windows short names (RUNNER~1)
+    for p, base in ((path, cwd), (path, cwd.resolve()), (path.resolve(), cwd.resolve())):
         try:
-            return path.relative_to(base).as_posix()     # src/m.py on every OS
-        except ValueError:
+            return p.relative_to(base).as_posix()     # src/m.py on every OS
+        except (ValueError, OSError):
             pass
     return str(path).replace(str(HOME), "~", 1)
 
@@ -816,7 +820,7 @@ def kill_tree(proc):
     try:
         if WINDOWS:
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, **NO_WINDOW)
         else:
             os.killpg(proc.pid, signal.SIGKILL)
     except (OSError, subprocess.SubprocessError):
@@ -829,7 +833,7 @@ def kill_tree(proc):
 
 def _run_bash(cmd, timeout):
     env = {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
-    extra = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS
+    extra = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW} if WINDOWS
              else {"start_new_session": True})
     proc = subprocess.Popen(shell_argv(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
@@ -948,7 +952,7 @@ def pdf_to_text(data):
         f.write(data)
         f.flush()
         r = subprocess.run([exe, "-layout", f.name, "-"], capture_output=True, text=True,
-                           errors="replace", timeout=120)
+                           encoding="utf-8", errors="replace", timeout=120, **NO_WINDOW)
     if r.returncode:
         raise ToolError(f"pdftotext failed: {r.stderr.strip()[:200]}")
     return r.stdout

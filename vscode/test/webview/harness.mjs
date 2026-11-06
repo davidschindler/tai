@@ -166,7 +166,7 @@ export class Harness {
           break;
         }
         case "searchFiles": {
-          const files = fs.readdirSync(this.ws, { recursive: true }).map(String)
+          const files = fs.readdirSync(this.ws, { recursive: true }).map((p) => String(p).split(path.sep).join("/"))
             .filter((f) => f.toLowerCase().includes(m.query.toLowerCase()))
             .map((f) => ({ path: path.join(this.ws, f), rel: f, dir: fs.statSync(path.join(this.ws, f)).isDirectory() }));
           this.post({ type: "fileResults", requestId: m.requestId, files });

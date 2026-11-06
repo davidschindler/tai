@@ -31,7 +31,7 @@ def mock(*steps):
 class Client:
     """Drives `tai --serve`. Every stdout line must be valid JSON (protocol purity)."""
 
-    def __init__(self, api, tmp_path, extra_env=None, args=(), key="test-key"):
+    def __init__(self, api, tmp_path, extra_env=None, args=(), key="test-key", popen_kw=None):
         self.ws = tmp_path / "ws"
         self.ws.mkdir(exist_ok=True)
         self.state = tmp_path / "state"
@@ -42,7 +42,7 @@ class Client:
         env.update(extra_env or {})
         self.p = subprocess.Popen([sys.executable, TAI, "--serve", *args], cwd=self.ws, env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  text=True, encoding="utf-8", bufsize=1)
+                                  text=True, encoding="utf-8", bufsize=1, **(popen_kw or {}))
         self.events = []
         self.cond = threading.Condition()
         self.replies = {}

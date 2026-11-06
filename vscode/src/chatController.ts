@@ -74,6 +74,14 @@ function human(n: number): string {
 /**
  * One chat: a webview (side bar or editor tab) plus its own `tai --serve` process.
  */
+/** Identity of a file on disk: real path (links, macOS /var → /private/var, Windows short names),
+ *  case-folded on Windows. */
+function fileKey(p: string): string {
+  let r = p;
+  try { r = fs.realpathSync.native(p); } catch { /* not on disk (yet) */ }
+  return process.platform === "win32" ? r.toLowerCase() : r;
+}
+
 export class ChatController implements vscode.Disposable {
   private webview?: vscode.Webview;
   private webviewSubs: vscode.Disposable[] = [];
@@ -346,10 +354,8 @@ export class ChatController implements vscode.Disposable {
       case "ide/diagnostics":
         return this.diagnostics(params?.path ?? null);
       case "ide/saveFile": {
-        const real = (p: string) => { try { return fs.realpathSync(p); } catch { return p; } };
-        const want = real(String(params?.path ?? ""));
-        const doc = vscode.workspace.textDocuments.find((d) => d.uri.scheme === "file" &&
-          (d.uri.fsPath === params?.path || real(d.uri.fsPath) === want));
+        const want = fileKey(String(params?.path ?? ""));
+        const doc = vscode.workspace.textDocuments.find((d) => d.uri.scheme === "file" && fileKey(d.uri.fsPath) === want);
         if (doc?.isDirty) await doc.save();
         return {};
       }
@@ -393,9 +399,10 @@ export class ChatController implements vscode.Disposable {
   private async diagnostics(file: string | null) {
     const sev = ["error", "warning", "info", "hint"];
     const collect = () => {
-      const all: [vscode.Uri, readonly vscode.Diagnostic[]][] = file
-        ? [[vscode.Uri.file(file), vscode.languages.getDiagnostics(vscode.Uri.file(file))]]
-        : vscode.languages.getDiagnostics();
+      // tai sends real paths (/private/var/… on macOS, long names on Windows); VS Code keeps
+      // the path it opened, so match by real location, not by text
+      const want = file ? fileKey(file) : undefined;
+      const all = vscode.languages.getDiagnostics().filter(([u]) => !want || (u.scheme === "file" && fileKey(u.fsPath) === want));
       const out: object[] = [];
       for (const [uri, ds] of all) {
         if (uri.scheme !== "file") continue;
