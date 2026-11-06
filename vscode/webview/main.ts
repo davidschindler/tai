@@ -523,7 +523,11 @@ function removeApproval(requestId: string) {
 }
 
 function relPath(p: string): string {
-  return S.cwd && p.startsWith(S.cwd + "/") ? p.slice(S.cwd.length + 1) : p;
+  if (!S.cwd) return p;
+  const win = S.cwd.includes("\\");                     // Windows: either separator, any case
+  const norm = (s: string) => (win ? s.replace(/\\/g, "/").toLowerCase() : s);
+  const base = norm(S.cwd).replace(/\/+$/, "") + "/";
+  return norm(p).startsWith(base) ? p.slice(base.length).replace(/\\/g, "/") : p;
 }
 
 // ------------------------------------------------------------------ /btw

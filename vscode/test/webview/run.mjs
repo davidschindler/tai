@@ -2,10 +2,12 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { after, afterEach, before, describe, it } from "node:test";
 import { Harness, launch, mock, startMock } from "./harness.mjs";
 
-const SHOTS = path.resolve(path.dirname(new URL(import.meta.url).pathname), "screenshots");
+const SHOTS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "screenshots");
+const SHELL = process.platform === "win32" ? "powershell" : "bash";    // tai's shell tool on this OS
 let browser, api;
 const open = new Set();
 afterEach(async () => {
@@ -126,7 +128,7 @@ describe("webview", { concurrency: false }, () => {
 
   it("denies with feedback (key 3, type, Enter)", async () => {
     const h = await harness();
-    await h.sendText(mock({ tools: [{ name: "bash", args: { command: "rm -rf build" } }] }, { text: "ok, not deleting" }));
+    await h.sendText(mock({ tools: [{ name: SHELL, args: { command: "rm -rf build" } }] }, { text: "ok, not deleting" }));
     await h.waitSel(".approval pre.cmd");
     assert.equal((await h.text(".approval pre.cmd"))[0], "rm -rf build");
     await h.page.keyboard.press("3");
@@ -143,7 +145,7 @@ describe("webview", { concurrency: false }, () => {
 
   it("'always' answers later approvals of the same kind", async () => {
     const h = await harness();
-    const cmd = (c) => ({ name: "bash", args: { command: c } });
+    const cmd = (c) => ({ name: SHELL, args: { command: c } });
     await h.sendText(mock({ tools: [cmd("echo one")] }, { tools: [cmd("echo two")] }, { text: "both ran" }));
     await h.waitSel(".approval");
     await h.page.click(".approval .opt:nth-child(2)");

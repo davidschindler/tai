@@ -470,6 +470,10 @@ class ToolError(Exception):
     pass
 
 
+class BadPath(ToolError, ValueError):
+    """An impossible path: a tool error, and a ValueError for callers that only display paths."""
+
+
 class Permissions:
     def __init__(self, mode="manual"):
         self.mode = mode
@@ -537,6 +541,8 @@ class Permissions:
 # ================================================================ file tools
 
 def resolve(p):
+    if "\0" in str(p):        # Windows path functions accept it silently; never a real file name
+        raise BadPath("invalid path (contains a null character)")
     path = Path(os.path.expanduser(str(p)))
     if not path.is_absolute():
         path = Path.cwd() / path
@@ -544,10 +550,13 @@ def resolve(p):
 
 
 def show_path(path):
-    try:
-        return str(path.relative_to(Path.cwd()))
-    except ValueError:
-        return str(path).replace(str(HOME), "~", 1)
+    cwd = Path.cwd()
+    for base in (cwd, cwd.resolve()):     # resolve() expands Windows short names (RUNNER~1) and links
+        try:
+            return path.relative_to(base).as_posix()     # src/m.py on every OS
+        except ValueError:
+            pass
+    return str(path).replace(str(HOME), "~", 1)
 
 
 def is_sensitive(path):

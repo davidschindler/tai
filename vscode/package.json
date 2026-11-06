@@ -5,7 +5,10 @@
   "version": "1.1.0",
   "publisher": "davidschindler",
   "license": "UNLICENSED",
-  "repository": { "type": "git", "url": "https://github.com/davidschindler/tai" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/davidschindler/tai"
+  },
   "private": true,
   "icon": "media/icon.png",
   "engines": {
@@ -49,61 +52,237 @@
       ]
     },
     "commands": [
-      { "command": "tai.open", "title": "Open tai", "category": "tai", "icon": { "light": "media/tai-tab-light.png", "dark": "media/tai-tab-dark.png" } },
-      { "command": "tai.focus", "title": "Focus Chat Input", "category": "tai" },
-      { "command": "tai.blur", "title": "Return to Editor", "category": "tai" },
-      { "command": "tai.openSidebar", "title": "Open in Side Bar", "category": "tai", "icon": "$(layout-sidebar-left)" },
-      { "command": "tai.openInNewTab", "title": "Open in New Tab", "category": "tai", "icon": "$(link-external)" },
-      { "command": "tai.newConversation", "title": "New Conversation", "category": "tai", "icon": "$(add)" },
-      { "command": "tai.history", "title": "Conversation History", "category": "tai", "icon": "$(history)" },
-      { "command": "tai.selectModel", "title": "Select Model", "category": "tai" },
-      { "command": "tai.cycleMode", "title": "Cycle Permission Mode", "category": "tai" },
-      { "command": "tai.insertAtMention", "title": "Insert @-Mention of Selection", "category": "tai" },
-      { "command": "tai.addFileToChat", "title": "Add to tai Chat", "category": "tai" },
-      { "command": "tai.openInTerminal", "title": "Open in Terminal", "category": "tai", "icon": "$(terminal)" },
-      { "command": "tai.setApiKey", "title": "Set Tilburg.ai API Key", "category": "tai" },
-      { "command": "tai.acceptDiff", "title": "Accept tai's Change", "category": "tai", "icon": "$(check)" },
-      { "command": "tai.rejectDiff", "title": "Reject tai's Change", "category": "tai", "icon": "$(close)" },
-      { "command": "tai.exportConversation", "title": "Export Conversation as Markdown", "category": "tai" },
-      { "command": "tai.restart", "title": "Restart tai", "category": "tai" },
-      { "command": "tai.stop", "title": "Stop", "category": "tai" },
-      { "command": "tai.showLogs", "title": "Show Logs", "category": "tai" }
+      {
+        "command": "tai.open",
+        "title": "Open tai",
+        "category": "tai",
+        "icon": {
+          "light": "media/tai-tab-light.png",
+          "dark": "media/tai-tab-dark.png"
+        }
+      },
+      {
+        "command": "tai.focus",
+        "title": "Focus Chat Input",
+        "category": "tai"
+      },
+      {
+        "command": "tai.blur",
+        "title": "Return to Editor",
+        "category": "tai"
+      },
+      {
+        "command": "tai.openSidebar",
+        "title": "Open in Side Bar",
+        "category": "tai",
+        "icon": "$(layout-sidebar-left)"
+      },
+      {
+        "command": "tai.openInNewTab",
+        "title": "Open in New Tab",
+        "category": "tai",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "tai.newConversation",
+        "title": "New Conversation",
+        "category": "tai",
+        "icon": "$(add)"
+      },
+      {
+        "command": "tai.history",
+        "title": "Conversation History",
+        "category": "tai",
+        "icon": "$(history)"
+      },
+      {
+        "command": "tai.selectModel",
+        "title": "Select Model",
+        "category": "tai"
+      },
+      {
+        "command": "tai.cycleMode",
+        "title": "Cycle Permission Mode",
+        "category": "tai"
+      },
+      {
+        "command": "tai.insertAtMention",
+        "title": "Insert @-Mention of Selection",
+        "category": "tai"
+      },
+      {
+        "command": "tai.addFileToChat",
+        "title": "Add to tai Chat",
+        "category": "tai"
+      },
+      {
+        "command": "tai.openInTerminal",
+        "title": "Open in Terminal",
+        "category": "tai",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "tai.setApiKey",
+        "title": "Set Tilburg.ai API Key",
+        "category": "tai"
+      },
+      {
+        "command": "tai.acceptDiff",
+        "title": "Accept tai's Change",
+        "category": "tai",
+        "icon": "$(check)"
+      },
+      {
+        "command": "tai.rejectDiff",
+        "title": "Reject tai's Change",
+        "category": "tai",
+        "icon": "$(close)"
+      },
+      {
+        "command": "tai.exportConversation",
+        "title": "Export Conversation as Markdown",
+        "category": "tai"
+      },
+      {
+        "command": "tai.restart",
+        "title": "Restart tai",
+        "category": "tai"
+      },
+      {
+        "command": "tai.stop",
+        "title": "Stop",
+        "category": "tai"
+      },
+      {
+        "command": "tai.showLogs",
+        "title": "Show Logs",
+        "category": "tai"
+      }
     ],
     "menus": {
       "view/title": [
-        { "command": "tai.newConversation", "when": "view == tai.chatView", "group": "navigation@1" },
-        { "command": "tai.history", "when": "view == tai.chatView", "group": "navigation@2" },
-        { "command": "tai.openInNewTab", "when": "view == tai.chatView", "group": "navigation@3" },
-        { "command": "tai.openInTerminal", "when": "view == tai.chatView", "group": "overflow@1" },
-        { "command": "tai.exportConversation", "when": "view == tai.chatView", "group": "overflow@2" },
-        { "command": "tai.restart", "when": "view == tai.chatView", "group": "overflow@3" },
-        { "command": "tai.showLogs", "when": "view == tai.chatView", "group": "overflow@4" }
+        {
+          "command": "tai.newConversation",
+          "when": "view == tai.chatView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tai.history",
+          "when": "view == tai.chatView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "tai.openInNewTab",
+          "when": "view == tai.chatView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "tai.openInTerminal",
+          "when": "view == tai.chatView",
+          "group": "overflow@1"
+        },
+        {
+          "command": "tai.exportConversation",
+          "when": "view == tai.chatView",
+          "group": "overflow@2"
+        },
+        {
+          "command": "tai.restart",
+          "when": "view == tai.chatView",
+          "group": "overflow@3"
+        },
+        {
+          "command": "tai.showLogs",
+          "when": "view == tai.chatView",
+          "group": "overflow@4"
+        }
       ],
       "editor/title": [
-        { "command": "tai.acceptDiff", "when": "resourceScheme == tai-proposed", "group": "navigation@1" },
-        { "command": "tai.rejectDiff", "when": "resourceScheme == tai-proposed", "group": "navigation@2" },
-        { "command": "tai.open", "when": "config.tai.showEditorTitleButton && !(resourceScheme == tai-proposed)", "group": "navigation@100" }
+        {
+          "command": "tai.acceptDiff",
+          "when": "resourceScheme == tai-proposed",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tai.rejectDiff",
+          "when": "resourceScheme == tai-proposed",
+          "group": "navigation@2"
+        },
+        {
+          "command": "tai.open",
+          "when": "config.tai.showEditorTitleButton && !(resourceScheme == tai-proposed)",
+          "group": "navigation@100"
+        }
       ],
       "editor/context": [
-        { "command": "tai.insertAtMention", "when": "editorTextFocus", "group": "tai@1" }
+        {
+          "command": "tai.insertAtMention",
+          "when": "editorTextFocus",
+          "group": "tai@1"
+        }
       ],
       "explorer/context": [
-        { "command": "tai.addFileToChat", "group": "tai@1" }
+        {
+          "command": "tai.addFileToChat",
+          "group": "tai@1"
+        }
       ],
       "commandPalette": [
-        { "command": "tai.acceptDiff", "when": "resourceScheme == tai-proposed" },
-        { "command": "tai.rejectDiff", "when": "resourceScheme == tai-proposed" },
-        { "command": "tai.addFileToChat", "when": "false" }
+        {
+          "command": "tai.acceptDiff",
+          "when": "resourceScheme == tai-proposed"
+        },
+        {
+          "command": "tai.rejectDiff",
+          "when": "resourceScheme == tai-proposed"
+        },
+        {
+          "command": "tai.addFileToChat",
+          "when": "false"
+        }
       ]
     },
     "keybindings": [
-      { "command": "tai.focus", "key": "ctrl+escape", "mac": "cmd+escape", "when": "!taiChatFocused" },
-      { "command": "tai.blur", "key": "ctrl+escape", "mac": "cmd+escape", "when": "taiChatFocused" },
-      { "command": "tai.openInNewTab", "key": "ctrl+shift+escape", "mac": "cmd+shift+escape" },
-      { "command": "tai.insertAtMention", "key": "alt+k", "when": "editorTextFocus" },
-      { "command": "tai.newConversation", "key": "ctrl+n", "mac": "cmd+n", "when": "taiChatFocused" },
-      { "command": "tai.acceptDiff", "key": "ctrl+enter", "mac": "cmd+enter", "when": "resourceScheme == tai-proposed" },
-      { "command": "tai.rejectDiff", "key": "ctrl+backspace", "mac": "cmd+backspace", "when": "resourceScheme == tai-proposed" }
+      {
+        "command": "tai.focus",
+        "key": "ctrl+escape",
+        "mac": "cmd+escape",
+        "when": "!taiChatFocused"
+      },
+      {
+        "command": "tai.blur",
+        "key": "ctrl+escape",
+        "mac": "cmd+escape",
+        "when": "taiChatFocused"
+      },
+      {
+        "command": "tai.openInNewTab",
+        "key": "ctrl+shift+escape",
+        "mac": "cmd+shift+escape"
+      },
+      {
+        "command": "tai.insertAtMention",
+        "key": "alt+k",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "tai.newConversation",
+        "key": "ctrl+n",
+        "mac": "cmd+n",
+        "when": "taiChatFocused"
+      },
+      {
+        "command": "tai.acceptDiff",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "resourceScheme == tai-proposed"
+      },
+      {
+        "command": "tai.rejectDiff",
+        "key": "ctrl+backspace",
+        "mac": "cmd+backspace",
+        "when": "resourceScheme == tai-proposed"
+      }
     ],
     "configuration": {
       "title": "tai",
@@ -125,7 +304,11 @@
         },
         "tai.initialPermissionMode": {
           "type": "string",
-          "enum": ["manual", "accept-edits", "auto"],
+          "enum": [
+            "manual",
+            "accept-edits",
+            "auto"
+          ],
           "enumDescriptions": [
             "Ask before file edits, commands and web fetches",
             "File edits run without asking; commands and fetches ask",
@@ -136,7 +319,9 @@
         },
         "tai.environmentVariables": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": {
+            "type": "string"
+          },
           "default": {},
           "markdownDescription": "Extra environment variables for tai, e.g. `{\"TAI_SEARCH_MODEL\": \"gpt-5.4-mini\"}`."
         },
@@ -189,7 +374,7 @@
     "@types/mocha": "^10.0.10",
     "@types/node": "^20.17.0",
     "@types/vscode": "^1.90.0",
-    "@vscode/test-electron": "^2.5.2",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.6.0",
     "diff": "^5.2.0",
     "dompurify": "^3.2.6",

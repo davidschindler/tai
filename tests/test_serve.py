@@ -577,7 +577,7 @@ def test_export_markdown(client, tmp_path):
     c.send("export me")
     out = tmp_path / "conv.md"
     md = c.call("export", {"path": str(out)})["markdown"]
-    assert "## You\n\nexport me" in md and out.read_text() == md
+    assert "## You\n\nexport me" in md and out.read_text(encoding="utf-8") == md
 
 
 def test_shutdown_while_busy_exits(client):
@@ -647,7 +647,7 @@ def test_lone_surrogate_does_not_break_the_session(client):
     end = c.wait("turn_end", start=m)
     assert end["reason"] == "done", end
     assert "half an emoji" in c.text_since(m)
-    _, end, m = c.send(mock({"tools": [{"name": SHELL, "args": {"command": "echo still ok"}}]}, {"text": "k"}))
+    _, end, m = c.send(mock({"tools": [{"name": SHELL, "args": {"command": "echo 'still ok'"}}]}, {"text": "k"}))
     assert "still ok" in c.wait("tool_end", start=m)["output"]      # approvals still reach the client
     assert c.call("sessions")["sessions"]
 
