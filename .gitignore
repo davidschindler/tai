@@ -1,6 +1,10 @@
 node_modules/
 dist/
+build/
+*.egg-info/
 *.vsix
 .vscode-test/
-test/webview/screenshots/
+vscode/test/webview/screenshots/
+vscode/tai/
 __pycache__/
+.pytest_cache/
