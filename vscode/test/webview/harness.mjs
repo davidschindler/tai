@@ -72,6 +72,7 @@ export class Harness {
     this.toHost = [];              // every message the webview posted
     this.errors = [];
     this.approvalWaiters = new Map();
+    this.openTurns = 0;            // tai's own view: turn_start without turn_end yet
     this.ws = cwd ?? fs.mkdtempSync(path.join(os.tmpdir(), "tai-ws-"));
     this.state = fs.mkdtempSync(path.join(os.tmpdir(), "tai-state-"));
   }
@@ -113,6 +114,8 @@ export class Harness {
       return Promise.resolve({});
     });
     c.onEvent((e) => {
+      if (e.type === "turn_start") this.openTurns++;
+      if (e.type === "turn_end") this.openTurns--;
       if (e.type === "request_cancelled" && this.approvalWaiters.has(e.requestId)) {
         this.approvalWaiters.delete(e.requestId);
         this.post({ type: "approvalDone", requestId: e.requestId });
@@ -204,9 +207,18 @@ export class Harness {
     return this.page.waitForSelector(sel, { timeout });
   }
 
+  /** Idle = tai has finished its turns (not only "the thinking indicator is hidden", which is
+   *  also true while a command runs) and the page has nothing pending. */
   async waitIdle(timeout = 15000) {
+    const end = Date.now() + timeout;
     await this.page.waitForFunction(() => document.getElementById("thinking").hidden &&
       !document.querySelector(".msg.user.pending, .msg.user.queued"), { timeout });
+    while (this.openTurns > 0) {
+      if (Date.now() > end) throw new Error(`waitIdle: tai still has ${this.openTurns} turn(s) running`);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await this.page.waitForFunction(() => document.getElementById("thinking").hidden &&
+      !document.querySelector(".msg.user.pending, .msg.user.queued"), { timeout: Math.max(1000, end - Date.now()) });
     await new Promise((r) => setTimeout(r, 120));
   }
 

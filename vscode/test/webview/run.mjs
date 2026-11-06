@@ -146,7 +146,7 @@ describe("webview", { concurrency: false }, () => {
   it("'always' answers later approvals of the same kind", async () => {
     const h = await harness();
     const cmd = (c) => ({ name: SHELL, args: { command: c } });
-    await h.sendText(mock({ tools: [cmd("echo one")] }, { tools: [cmd("echo two")] }, { text: "both ran" }));
+    await h.sendText(mock({ tools: [cmd("sleep 1; echo one")] }, { tools: [cmd("sleep 1; echo two")] }, { text: "both ran" }));  // slow, like PowerShell starting
     await h.waitSel(".approval");
     await h.page.click(".approval .opt:nth-child(2)");
     await h.waitIdle();

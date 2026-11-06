@@ -59,4 +59,4 @@ python -m pytest tests            # tai: protocol, terminal program, per-OS beha
 cd vscode && npm install && npm test
 ```
 
-GitHub Actions runs everything on Windows, macOS and Linux for every push. Pushing a tag such as `v1.3.0` builds the `.vsix` and `.whl` and attaches them to a release.
+GitHub Actions runs everything on Windows, macOS and Linux for every push. Pushing a tag such as `v1.3.1` builds the `.vsix` and `.whl` and attaches them to a release.
