@@ -1,4 +1,9 @@
 import * as esbuild from "esbuild";
+import fs from "fs";
+
+// tai itself ships inside the extension (tai/tai.py), so it works with just Python installed.
+fs.mkdirSync("tai", { recursive: true });
+fs.copyFileSync("../tai.py", "tai/tai.py");
 
 const watch = process.argv.includes("--watch");
 const builds = [

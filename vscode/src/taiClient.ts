@@ -1,4 +1,4 @@
-import { ChildProcess, spawn } from "child_process";
+import { ChildProcess, spawn, spawnSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -8,8 +8,8 @@ import type { TaiEvent } from "./protocol";
 export const PROTOCOL_VERSION = 1;
 
 export interface ClientOptions {
-  executable: string;           // path to tai
-  python?: string;              // optional interpreter
+  executable: string;           // path to tai (or tai.py)
+  python?: string;              // interpreter to run it with
   cwd: string;
   env: NodeJS.ProcessEnv;
   args?: string[];
@@ -19,23 +19,86 @@ export interface ClientOptions {
 type Pending = { resolve: (v: any) => void; reject: (e: Error) => void; timer?: NodeJS.Timeout };
 export type RequestHandler = (method: string, params: any, id: string) => Promise<unknown>;
 
-/** Finds tai: explicit setting, then PATH, then ~/.local/bin/tai. */
-export function findExecutable(setting: string | undefined, envPath = process.env.PATH ?? ""): string | undefined {
-  const expand = (p: string) => (p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p);
-  if (setting && setting.trim()) {
-    const p = expand(setting.trim());
-    return fs.existsSync(p) ? p : undefined;
+const WIN = process.platform === "win32";
+const expandHome = (p: string) => (p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p);
+
+/** How to run tai: `python executable …` when python is set, otherwise `executable …`. */
+export interface TaiCommand {
+  executable: string;
+  python?: string;
+  source: "setting" | "bundled" | "installed";
+}
+
+/** A working Python ≥ 3.9: the setting, else the usual names (on Windows the `py` launcher first;
+ *  the Microsoft Store's `python3` stub prints nothing and is rejected by the version check). */
+const pythonCache = new Map<string, string | undefined>();
+export function findPython(setting?: string): string | undefined {
+  const key = (setting ?? "").trim();
+  if (pythonCache.has(key)) return pythonCache.get(key);
+  const cands = key ? [expandHome(key)] : WIN ? ["py", "python", "python3"] : ["python3", "python"];
+  let found: string | undefined;
+  for (const c of cands) {
+    try {
+      // returns the real interpreter path (so the `py` launcher is not left in between)
+      const r = spawnSync(c, ["-c", "import sys; print(sys.version_info >= (3, 9), sys.executable)"],
+        { encoding: "utf8", timeout: 15000, windowsHide: true });
+      const m = /^True (.+)$/.exec((r.stdout ?? "").trim());
+      if (r.status === 0 && m) { found = m[1].trim() || c; break; }
+    } catch { /* try the next */ }
   }
+  if (found) pythonCache.set(key, found);      // a failure is retried next time (Python may get installed)
+  return found;
+}
+
+/** `tai` installed on PATH (pipx/pip: tai.exe on Windows), else ~/.local/bin/tai. */
+export function findInstalled(envPath = process.env.PATH ?? ""): string | undefined {
+  const names = WIN ? ["tai.exe"] : ["tai"];
   for (const dir of envPath.split(path.delimiter)) {
     if (!dir) continue;
-    const p = path.join(expand(dir), "tai");
-    try {
-      fs.accessSync(p, fs.constants.X_OK);
-      if (fs.statSync(p).isFile()) return p;
-    } catch { /* keep looking */ }
+    for (const n of names) {
+      const p = path.join(expandHome(dir), n);
+      try {
+        if (!WIN) fs.accessSync(p, fs.constants.X_OK);
+        if (fs.statSync(p).isFile()) return p;
+      } catch { /* keep looking */ }
+    }
   }
-  const fallback = path.join(os.homedir(), ".local", "bin", "tai");
+  const fallback = path.join(os.homedir(), ".local", "bin", WIN ? "tai.exe" : "tai");
   return fs.existsSync(fallback) ? fallback : undefined;
+}
+
+/**
+ * Finds tai. Order: the `tai.executablePath` setting; the copy bundled with the extension (always
+ * the matching protocol; needs only Python, no packages); an installed `tai`.
+ * `preferInstalled` (for the terminal, where the installed one has the nicer interface) swaps the last two.
+ */
+export function findTai(o: { setting?: string; pythonSetting?: string; bundled?: string; envPath?: string;
+  preferInstalled?: boolean }): TaiCommand | undefined {
+  const py = () => findPython(o.pythonSetting);
+  if (o.pythonSetting && o.pythonSetting.trim() && !py()) return undefined;   // a configured Python must work
+  if (o.setting && o.setting.trim()) {
+    const p = expandHome(o.setting.trim());
+    if (!fs.existsSync(p)) return undefined;
+    // a .py file (or any file when a Python is configured) runs through Python
+    if (p.endsWith(".py") || (o.pythonSetting && o.pythonSetting.trim())) {
+      const python = py();
+      return python ? { executable: p, python, source: "setting" } : undefined;
+    }
+    return { executable: p, source: "setting" };
+  }
+  const bundled = () => {
+    if (!o.bundled || !fs.existsSync(o.bundled)) return undefined;
+    const python = py();
+    return python ? { executable: o.bundled, python, source: "bundled" as const } : undefined;
+  };
+  const installed = () => {
+    const p = findInstalled(o.envPath);
+    if (!p) return undefined;
+    // a configured interpreter runs a script-style tai (not a Windows .exe launcher)
+    const python = o.pythonSetting && o.pythonSetting.trim() && !p.endsWith(".exe") ? py() : undefined;
+    return { executable: p, python, source: "installed" as const };
+  };
+  return o.preferInstalled ? installed() ?? bundled() : bundled() ?? installed();
 }
 
 /**
@@ -51,7 +114,7 @@ export class TaiClient {
   private requestHandler?: RequestHandler;
   private stderrTail = "";
   private exited = false;
-  private readyPromise?: Promise<{ version: string; protocol: number }>;
+  private readyPromise?: Promise<{ version: string; protocol: number; hasKey?: boolean }>;
 
   constructor(private opts: ClientOptions) {}
 
@@ -72,7 +135,7 @@ export class TaiClient {
   }
 
   /** Spawn the process and wait for its "ready" event. */
-  start(timeoutMs = 20000): Promise<{ version: string; protocol: number }> {
+  start(timeoutMs = 20000): Promise<{ version: string; protocol: number; hasKey?: boolean }> {
     if (this.readyPromise) return this.readyPromise;
     const { executable, python, cwd, env, args = [] } = this.opts;
     const cmd = python ? python : executable;
@@ -85,8 +148,8 @@ export class TaiClient {
       const timer = setTimeout(() => fail(`tai did not start within ${timeoutMs / 1000}s`), timeoutMs);
       let proc: ChildProcess;
       try {
-        proc = spawn(cmd, argv, { cwd, env: { ...env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" },
-          stdio: ["pipe", "pipe", "pipe"] });
+        proc = spawn(cmd, argv, { cwd, env: { ...env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
+          stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
       } catch (e: any) {
         clearTimeout(timer);
         fail(`could not start ${cmd}: ${e.message}`);
@@ -124,7 +187,7 @@ export class TaiClient {
               return;
             }
             settled = true;
-            resolve({ version: ev.version, protocol: ev.protocol });
+            resolve({ version: ev.version, protocol: ev.protocol, hasKey: ev.hasKey });
           }
           for (const h of this.eventHandlers) {
             try { h(ev); } catch (e: any) { this.opts.log?.(`event handler failed: ${e?.stack ?? e}`); }

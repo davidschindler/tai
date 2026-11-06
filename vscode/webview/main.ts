@@ -240,7 +240,7 @@ function addAssistant(text: string) {
   endAssistant();
 }
 
-const LABEL_ARG: Record<string, string> = { bash: "command", web_search: "query", web_fetch: "url", grep: "pattern" };
+const LABEL_ARG: Record<string, string> = { bash: "command", powershell: "command", web_search: "query", web_fetch: "url", grep: "pattern" };
 
 function toolRow(id: string, name: string, label: string, shown: string, args: Record<string, unknown>, agent?: string | null): HTMLElement {
   const row = el("div", "tool running");
@@ -270,9 +270,9 @@ function toolRow(id: string, name: string, label: string, shown: string, args: R
     detail.hidden = !detail.hidden;
     row.classList.toggle("open", !detail.hidden);
   });
-  if (name === "bash" && typeof args.command === "string") {
+  if ((name === "bash" || name === "powershell") && typeof args.command === "string") {
     const pre = el("pre", "cmd");
-    pre.textContent = "$ " + args.command;
+    pre.textContent = (name === "powershell" ? "PS> " : "$ ") + args.command;
     detail.append(pre);
   }
   tools.set(id, row);
@@ -1080,7 +1080,7 @@ window.addEventListener("message", (ev: MessageEvent<HostMessage>) => {
       if (m.status === "starting") setBanner("info", "Starting tai…");
       else if (m.status === "ready") {
         S.ready = true;
-        if (m.needsKey) setBanner("error", "No Tilburg.ai API key found (TILBURG_AI_API_KEY).", [{ label: "Set API key", run: () => send({ type: "setApiKey" }) }]);
+        if (m.needsKey) setBanner("error", "No Tilburg.ai API key found. Set it once (stored in your system's keychain):", [{ label: "Set API key", run: () => send({ type: "setApiKey" }) }]);
         else setBanner("", "");
       } else {
         S.ready = false;

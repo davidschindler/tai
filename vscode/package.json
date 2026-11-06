@@ -2,9 +2,10 @@
   "name": "tai-vscode",
   "displayName": "tai — Tilburg.ai agent",
   "description": "Chat with tai, your Tilburg.ai coding and research agent, right inside VS Code: edits with diffs, approvals, sub-agents, web search, sessions and checkpoints.",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "publisher": "davidschindler",
   "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "https://github.com/davidschindler/tai" },
   "private": true,
   "icon": "media/icon.png",
   "engines": {
@@ -110,12 +111,12 @@
         "tai.executablePath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to the `tai` program. Empty: look on `PATH`, then `~/.local/bin/tai`."
+          "markdownDescription": "Path to a `tai` program (or `tai.py`) to use instead of the copy built into the extension."
         },
         "tai.pythonPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Python interpreter used to run `tai`. Empty: run `tai` directly (its `#!` line decides)."
+          "markdownDescription": "Python interpreter (3.9 or newer) that runs tai. Empty: `python3`/`python` from `PATH` (on Windows the `py` launcher first)."
         },
         "tai.model": {
           "type": "string",
@@ -176,11 +177,11 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc -p . --noEmit && tsc -p webview --noEmit",
-    "test:python": "cd test/python && python3 -m pytest -q -p no:cacheprovider",
+    "test:python": "cd .. && python3 -m pytest -q -p no:cacheprovider tests",
     "test:webview": "node test/webview/run.mjs",
     "test:vscode": "node test/vscode/run.mjs",
     "test": "npm run typecheck && npm run build && npm run test:python && npm run test:webview && npm run test:vscode",
-    "package": "node esbuild.mjs --minify && vsce package --no-dependencies --allow-missing-repository --skip-license"
+    "package": "node esbuild.mjs --minify && vsce package --no-dependencies --skip-license"
   },
   "devDependencies": {
     "@types/diff": "^5.2.3",

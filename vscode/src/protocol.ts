@@ -46,7 +46,7 @@ export type TranscriptItem =
 
 /** Events from `tai --serve` (method "event"). */
 export type TaiEvent =
-  | { type: "ready"; version: string; protocol: number }
+  | { type: "ready"; version: string; protocol: number; hasKey?: boolean }
   | { type: "user"; index: number; clientId?: string | null; injected: boolean; text: string; files: string[]; context: string }
   | { type: "turn_start"; index: number }
   | { type: "text"; delta: string }
@@ -78,6 +78,7 @@ export interface ApprovalParams {
   agent: string;
   detail: {
     type?: "edit" | "bash" | "fetch" | "read";
+    shell?: string;               // "Bash" or "PowerShell"
     path?: string;
     old?: string | null;
     new?: string | null;

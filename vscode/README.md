@@ -1,11 +1,11 @@
 # tai for VS Code
 
-A chat panel for **tai**, the Tilburg.ai agent (`~/.local/bin/tai`), in the spirit of the Claude Code and Codex extensions. The extension starts `tai --serve` and talks to it over a JSON-lines protocol, so the agent, its tools and its permission rules are the same as in the terminal.
+A chat panel for **tai**, the Tilburg.ai agent, in the spirit of the Claude Code and Codex extensions. Works on Windows, macOS and Linux. The extension starts `tai --serve` and talks to it over a JSON-lines protocol, so the agent, its tools and its permission rules are the same as in the terminal.
 
 ## Features
 
 - **Chat in the side bar or in editor tabs.** Each tab is its own conversation with its own tai process (`Ctrl+Shift+Esc`, or the ↗ button). Replies stream as markdown, with highlighted code blocks (copy / insert at cursor) and clickable `file.py:12` references.
-- **Tool calls as they happen.** Read, List, Grep, Edit, Write, Bash, WebSearch, Fetch and Diagnostics appear as compact rows you can expand. Edits show a line-numbered diff, and sub-agents (`task`) appear as boxes with their own tool calls, running in parallel.
+- **Tool calls as they happen.** Read, List, Grep, Edit, Write, Bash (PowerShell on Windows), WebSearch, Fetch and Diagnostics appear as compact rows you can expand. Edits show a line-numbered diff, and sub-agents (`task`) appear as boxes with their own tool calls, running in parallel.
 - **Approvals.** File edits, commands and web fetches ask first: *1 Yes · 2 Yes, don't ask again · 3 No, and tell tai what to do instead*. Edits also open in VS Code's **native diff editor**, with ✓/✗ buttons in the editor title (`Ctrl+Enter` / `Ctrl+Backspace`).
 - **Permission modes.** *manual* → *accept edits* → *auto* (`Shift+Tab` in the input, or click the mode pill). Secret files (`~/.ssh`, `.env`, …) always ask.
 - **Editor context.** tai sees the file you have open and your selection (the chip above the input; click it to leave it out of the next message). `Alt+K` inserts an `@file#L5-9` mention of the selection, and *Add to tai Chat* in the explorer menu mentions files and folders.
@@ -21,8 +21,10 @@ A chat panel for **tai**, the Tilburg.ai agent (`~/.local/bin/tai`), in the spir
 
 ## Setup
 
-1. `tai` must be at `~/.local/bin/tai` or on `PATH` (or set `tai.executablePath`).
-2. The API key is taken from `TILBURG_AI_API_KEY` in VS Code's environment, then from the key stored with **tai: Set Tilburg.ai API Key**, then from `~/.secrets`.
+1. **Python 3.9 or newer** must be installed ([python.org](https://www.python.org/downloads/); on Windows tick *Add python.exe to PATH*). tai itself is built into the extension and needs no extra packages.
+2. **API key.** The first time, tai shows a *Set API key* button; the key goes into your system's keychain (VS Code secret storage) and never into settings or files. It is also taken from `TILBURG_AI_API_KEY`, from a key stored with `tai --set-key`, or from `~/.secrets`.
+
+To use your own copy of tai instead of the built-in one, set `tai.executablePath`.
 
 ## Settings
 
@@ -61,8 +63,10 @@ npm test               # typecheck, build, then all three test layers
 npm run package        # tai-vscode-<version>.vsix
 ```
 
-Tests (no real API calls; `test/mock_api.py` stands in for Tilburg.ai and is scripted through `MOCK:` messages):
+`npm run build` also copies `../tai.py` into `tai/`, the copy shipped in the `.vsix`.
 
-- `test/python`: the `tai --serve` protocol (46 tests: streaming, tools, approvals, modes, cancel, sub-agents, queueing, errors, /btw, /compact, sessions, rewind, attachments, diagnostics, autosave, and the terminal CLI).
+Tests (no real API calls; `../tests/mock_api.py` stands in for Tilburg.ai and is scripted through `MOCK:` messages):
+
+- `../tests`: tai itself: the `tai --serve` protocol (streaming, tools, approvals, modes, cancel, sub-agents, queueing, errors, /btw, /compact, sessions, rewind, attachments, diagnostics, autosave), the terminal program, and per-OS behaviour (encodings, line endings, shell, key storage).
 - `test/webview`: the real UI bundle in headless Chrome, wired to a real `tai --serve` (screenshots in `test/webview/screenshots`).
 - `test/vscode`: integration tests in a downloaded, isolated VS Code (native diffs and their buttons, diagnostics, autosave, editor context, quick picks, tabs, crash recovery). Run them headless on a private X server: `TAI_TEST_DISPLAY=:99 npm run test:vscode`.

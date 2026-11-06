@@ -408,7 +408,7 @@ describe("tai extension", function () {
       const m = probe.mark();
       await ext.sidebar.restart();
       const st = await until(() => probe.since(m, "status").find((s: any) => s.status === "error"), 10000, "error status");
-      assert.match(st.message, /Could not find the tai program/);
+      assert.match(st.message, /tai\.executablePath/);
     } finally {
       await cfg.update("executablePath", undefined, vscode.ConfigurationTarget.Workspace);
       await ext.sidebar.restart();
@@ -416,9 +416,36 @@ describe("tai extension", function () {
     }
   });
 
+  it("reports a Python setting that does not work", async () => {
+    const cfg = vscode.workspace.getConfiguration("tai");
+    await cfg.update("pythonPath", path.join(WS, "no-such-python"), vscode.ConfigurationTarget.Workspace);
+    try {
+      const m = probe.mark();
+      await ext.sidebar.restart();
+      const st = await until(() => probe.since(m, "status").find((s: any) => s.status === "error"), 20000, "error status");
+      assert.match(st.message, /tai\.pythonPath.*Python 3\.9 or newer/);
+    } finally {
+      await cfg.update("pythonPath", undefined, vscode.ConfigurationTarget.Workspace);
+      await ext.sidebar.restart();
+      await until(() => (ext.sidebar as any).client?.running, 10000, "restarted");
+    }
+  });
+
+  it("runs the copy of tai built into the extension", async () => {
+    const opts = (ext.sidebar as any).client.opts;
+    assert.strictEqual(opts.executable, path.join(ext.shared.ctx.extensionPath, "tai", "tai.py"));
+    assert.ok(opts.python, "run through a Python interpreter");
+  });
+
   it("opens the conversation in a terminal", async () => {
+    await probe.send("something to continue in the terminal");
     await vscode.commands.executeCommand("tai.openInTerminal");
     const term = await until(() => vscode.window.terminals.find((t) => t.name === "tai"), 5000, "terminal");
+    const o = term.creationOptions as vscode.TerminalOptions;
+    assert.deepStrictEqual((o.shellArgs as string[]).slice(-2), ["-r", ext.sidebar.state!.session.id]);
+    assert.ok(await term.processId, "process started");
+    await sleep(4000);
+    assert.strictEqual(term.exitStatus, undefined, "tai is still running in the terminal (waiting for input)");
     term.dispose();
   });
 

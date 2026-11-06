@@ -1,0 +1,3050 @@
+#!/usr/bin/env python3
+"""tai — a terminal AI agent on Tilburg.ai.
+
+  tai                          interactive agent session in the current folder
+  tai "fix the typo in intro.tex"   one task, then exit (add -i to keep chatting)
+  cat log.txt | tai "why did this fail?"
+  tai -f draft.md "tighten the intro"
+  tai -c                       continue the last conversation
+  tai -r ID                    resume a saved session (sessions from the VS Code extension)
+  tai --chat                   plain chat, no tools
+  tai --models                 list available models
+
+Tools: read/list/grep files and web_search run on their own. Editing files,
+running commands and fetching web pages (per site) ask for approval first.
+The agent can start sub-agents (task tool), which run in parallel.
+Shift+Tab (or /mode) cycles the permission mode: manual → accept-edits → auto.
+/btw asks a side question that is not kept in the conversation.
+
+Key: $TILBURG_AI_API_KEY, or store one with `tai --set-key`.
+Models: $TAI_MODEL (default below), $TAI_SEARCH_MODEL for web searches.
+"""
+import argparse
+import concurrent.futures
+import datetime
+import difflib
+import fnmatch
+import json
+import os
+import platform
+import queue
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+from pathlib import Path
+
+API_ENDPOINT = os.environ.get("TAI_API_BASE", "https://api.tilburg.ai/v1").rstrip("/")
+DEFAULT_MODEL = os.environ.get("TAI_MODEL", "gpt-5.6-sol")
+SEARCH_MODEL = os.environ.get("TAI_SEARCH_MODEL", "gpt-5.4-nano")
+MAX_STEPS = 60              # tool rounds per user message
+SUB_MAX_STEPS = 40          # tool rounds per sub-agent
+MAX_PARALLEL_AGENTS = 4
+MAX_TOOL_OUTPUT = 30_000    # characters returned to the model per tool call
+WINDOWS = os.name == "nt"
+
+
+def _state_dir():
+    if os.environ.get("XDG_STATE_HOME"):
+        return Path(os.environ["XDG_STATE_HOME"]) / "tai"
+    if WINDOWS and os.environ.get("LOCALAPPDATA"):
+        return Path(os.environ["LOCALAPPDATA"]) / "tai"
+    return Path.home() / ".local" / "state" / "tai"
+
+
+STATE_DIR = _state_dir()
+KEY_FILE = STATE_DIR / "api_key"           # written by `tai --set-key`
+LAST_CONV = STATE_DIR / "last.json"
+HISTORY = STATE_DIR / "history"
+
+HOME = Path.home()
+# Reading these asks for approval: their content would be sent to the API.
+SENSITIVE = [HOME / ".ssh", HOME / ".gnupg", HOME / ".secrets", HOME / ".netrc", HOME / ".aws",
+             HOME / ".config/gh", HOME / ".claude.json", HOME / ".npmrc", HOME / ".docker", KEY_FILE]
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache",
+             ".pytest_cache", ".ipynb_checkpoints", ".Rproj.user"}
+# Environment variables hidden from commands the agent runs.
+SECRET_ENV = re.compile(r"(API_?KEY|_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)$", re.I)
+
+try:
+    from rich import box
+    from rich.align import Align
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.rule import Rule
+    from rich.table import Table
+    from rich.text import Text
+
+    console = Console(highlight=False)
+    RICH = True
+except ImportError:
+    RICH = False
+
+# Tilburg University house colors (navy brightened so it reads on dark terminals too)
+GOLD = "#c49a06"
+BLUE = "#3f7fc4"
+GREY = "#8a8a8a"
+
+# The Tilburg University emblem (tree in a circle, ringed by gold diamonds and squares),
+# traced from the official logo as braille art: (characters, color per character).
+LOGO = [
+    ('       ⢠⣾⣷⡄       ', '.......gggg.......'),
+    ('  ⢰⣶⣶   ⠙⠋   ⣴⣶⡆  ', '..ggg...gg...ggg..'),
+    ('  ⠘⠛⠋ ⣠⢄⢐⠣⡢⡀ ⠙⠛⠃  ', '..ggg.bbbbbb.ggg..'),
+    (' ⣀  ⠐⢞⡲⢍⢎⡱⡪⠶⠶⠂  ⣀ ', '.g..bbbbbbbbbb..g.'),
+    ('⢾⣿⡷  ⢐⡽⡓⢻⣿⠙⡫⠆  ⢾⣿⡷', 'ggg..bbbbbbbb..ggg'),
+    (' ⠉   ⣸⣗⠃⡼⣇⢰⣷⠆   ⠉ ', '.g...bbbbbbbb...g.'),
+    ('  ⢠⣤⣄⠙⠫⣓⣥⣬⡺⠟⠋⣠⣤⡄  ', '..gggbbbbbbbbggg..'),
+    ('  ⠸⠿⠿   ⣠⣄   ⠻⠿⠇  ', '..ggg...gg...ggg..'),
+    ('       ⠘⢿⡿⠃       ', '.......gggg.......'),
+]
+
+IO_HOOKS = {"before_write": None, "after_write": None}   # set by the IDE server (tai --serve)
+STREAMS = set()                 # open API responses, so a cancel can cut them off at once
+STREAMS_LOCK = threading.Lock()
+IO = threading.RLock()          # serializes terminal output and approval prompts
+CANCEL = threading.Event()      # set by Ctrl+C; sub-agents stop at the next step
+_tls = threading.local()        # per-thread output prefix (for sub-agents)
+
+
+class Usage:
+    """Session token counters, shared by the main agent and sub-agents."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.inp = self.out = 0     # billed tokens this session
+        self.ctx = 0                # size of the main conversation at the last reply
+        self.max_ctx = None         # context window of the current model (if known)
+        self.streaming = 0          # estimated output tokens of replies still streaming
+
+    def add(self, usage, main=False):
+        if not usage:
+            return
+        with self.lock:
+            i, o = usage.get("prompt_tokens") or 0, usage.get("completion_tokens") or 0
+            self.inp += i
+            self.out += o
+            if main:
+                self.ctx = i + o
+
+    def stream(self, n):
+        with self.lock:
+            self.streaming += n
+
+    def total(self):
+        return self.inp + self.out + self.streaming
+
+    def ctx_text(self):
+        if not self.ctx:
+            return ""
+        if self.max_ctx:
+            return f"ctx {human(self.ctx)}/{human(self.max_ctx)} ({100 * self.ctx // self.max_ctx}%)"
+        return f"ctx {human(self.ctx)}"
+
+
+USAGE = Usage()
+
+# Permission modes, cycled with Shift+Tab or /mode.
+MODES = ["manual", "accept-edits", "auto"]
+MODE_INFO = {"manual": "asks before edits, commands and fetches",
+             "accept-edits": "file edits run without asking",
+             "auto": "edits, commands and fetches run without asking (secret files still ask)"}
+
+
+# ================================================================ output helpers
+
+def say(msg, style=None, one_line=False):
+    """Print a str or rich renderable; sub-agent threads get their label as a prefix."""
+    prefix = getattr(_tls, "prefix", "")
+    with IO:
+        if not RICH:
+            print(prefix + str(msg))
+        elif isinstance(msg, str):
+            if prefix:
+                msg = "\n".join(prefix + l for l in msg.lstrip("\n").split("\n"))
+            console.print(msg, style=style, markup=False, highlight=False,
+                          no_wrap=one_line, overflow="ellipsis" if one_line else None)
+        else:
+            if prefix and isinstance(msg, Text):
+                msg = Text.assemble((prefix, "dim"), msg)
+            console.print(msg, highlight=False, no_wrap=one_line,
+                          overflow="ellipsis" if one_line else None)
+
+
+class working:
+    """Spinner while a slow tool runs (main thread only, so it never fights a prompt)."""
+
+    def __init__(self, text):
+        self.text, self.status = text, None
+
+    def __enter__(self):
+        if RICH and sys.stdout.isatty() and threading.current_thread() is threading.main_thread():
+            self.status = console.status(Text(self.text, style=GREY), spinner="dots",
+                                         spinner_style=GOLD)
+            self.status.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        if self.status:
+            self.status.__exit__(*exc)
+
+
+class Thinking:
+    """Live view of a streaming reply: the text so far plus an animated status line
+    ('Thinking…' until the first token, then 'Responding…') with live token counts."""
+    FRAMES = "·✢✳✶✻✽✻✶✳✢"
+
+    def __init__(self):
+        self.start = time.time()
+        self.body = None        # rendered markdown of the reply so far
+        self.out = 0            # estimated output tokens of this reply
+        self.tool = ""          # name of a tool call being written
+
+    def status(self):
+        t = time.time() - self.start
+        verb = f"Writing {self.tool} call… " if self.tool else "Responding… " if self.out else "Thinking… "
+        bits = [f"{int(t)}s"]
+        if self.out:
+            bits.append(f"↓ ~{human(self.out)} tokens")
+        if USAGE.total():
+            bits.append(f"session {human(USAGE.total())}")
+        if USAGE.ctx_text():
+            bits.append(USAGE.ctx_text())
+        bits.append("ctrl+c to interrupt")
+        return Text.assemble((self.FRAMES[int(t * 8) % len(self.FRAMES)] + " ", GOLD),
+                             (verb, f"bold {GOLD}"), (f"({' · '.join(bits)})", GREY))
+
+    def __rich__(self):
+        if self.body is None:
+            return self.status()
+        return Group(self.body, Text(""), self.status())
+
+
+def with_gutter(renderable, mark="●", style="bold"):
+    """Claude-Code-style '● ' gutter in front of a block."""
+    g = Table.grid(padding=(0, 1))
+    g.add_column(width=1, no_wrap=True)
+    g.add_column(ratio=1)
+    g.add_row(Text(mark, style=style), renderable)
+    return g
+
+
+def short_path(p, n=44):
+    s = str(p).replace(str(HOME), "~", 1)
+    if len(s) <= n:
+        return s
+    sep = "\\" if WINDOWS and "\\" in s else "/"
+    parts = s.split(sep)
+    tail = parts[-1]
+    for part in reversed(parts[1:-1]):
+        if len(part) + len(tail) + 3 > n - len(parts[0]):
+            break
+        tail = part + sep + tail
+    return f"{parts[0]}{sep}…{sep}{tail}"[: n]
+
+
+def welcome(conv, perms=None):
+    where = short_path(Path.cwd())
+    if not RICH:
+        print(f"tai · {conv['model']} · {where} · /help for commands, Ctrl+C twice to quit")
+        return
+    try:
+        import pwd
+        name = (pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0] or os.environ.get("USER", "")).split()[0]
+    except Exception:
+        name = os.environ.get("USER", "there")
+    logo = Text()
+    for i, (chars, colors) in enumerate(LOGO):
+        for ch, k in zip(chars, colors):
+            logo.append(ch, style=GOLD if k == "g" else BLUE if k == "b" else None)
+        if i < len(LOGO) - 1:
+            logo.append("\n")
+    word = Text.assemble(("TILBURG", f"bold {BLUE}"), (" ◆ ", GOLD), ("UNIVERSITY", f"bold {BLUE}"))
+    left = Group(Align.center(logo), Text(""), Align.center(word))
+    mode = "agent · files, shell, web, sub-agents" if conv["tools"] else "chat · no tools"
+    info = Group(
+        Text.assemble(("Welcome back, ", "bold"), (name, f"bold {GOLD}"), ("!", "bold")),
+        Text(""),
+        Text.assemble(("model  ", GREY), (conv["model"], "bold")),
+        Text.assemble(("mode   ", GREY), mode),
+        *([Text.assemble(("perms  ", GREY), (perms.mode, f"bold {GOLD}" if perms.mode != "manual" else ""),
+                         (" · shift+tab to cycle", GREY))] if perms and conv["tools"] else []),
+        Text.assemble(("folder ", GREY), where),
+        Text(""),
+        Text("Getting started", style=f"bold {GOLD}"),
+        Text.assemble(("· ", GREY), "Ask a question or describe a task"),
+        Text.assemble(("· ", GREY), ("/", "bold"), " for commands, ", ("/model", "bold"), " to switch"),
+        Text.assemble(("· ", GREY), ("alt+enter", "bold"), " new line · ", ("ctrl+c ×2", "bold"), " quit"),
+    )
+    if console.width >= 72:
+        body = Table.grid(padding=(0, 4))
+        body.add_column(no_wrap=True)
+        body.add_column()
+        body.add_row(left, info)
+    else:
+        body = Group(left, Text(""), info)
+    console.print(Panel(body, box=box.ROUNDED, border_style=GOLD, padding=(1, 2), expand=False,
+                        title=Text.assemble((" tai ", f"bold {GOLD}"), ("· Tilburg.ai ", GREY)),
+                        title_align="left"))
+
+
+def dim(msg):
+    say(msg, "dim")
+
+
+def err(msg):
+    say(msg, "red")
+
+
+def clip(s, n=100):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def human(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+# ================================================================ API
+
+def stored_key():
+    try:
+        return KEY_FILE.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def api_key():
+    key = os.environ.get("TILBURG_AI_API_KEY") or stored_key()
+    if not key:
+        sys.exit("tai: no API key. Run `tai --set-key` once, or set TILBURG_AI_API_KEY.")
+    return key
+
+
+def set_key():
+    import getpass
+    try:
+        key = getpass.getpass("Tilburg.ai API key (input hidden): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(1)
+    if not key:
+        sys.exit("tai: no key entered, nothing changed")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # create it private from the start (POSIX); on Windows the per-user folder is private already
+    fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(key + "\n")
+    if not WINDOWS:
+        os.chmod(KEY_FILE, 0o600)
+    print(f"Saved to {KEY_FILE}. ($TILBURG_AI_API_KEY, when set, takes precedence.)")
+
+
+def request(path, payload=None):
+    req = urllib.request.Request(
+        API_ENDPOINT + path,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Authorization": f"Bearer {api_key()}", "Content-Type": "application/json"},
+    )
+    try:
+        return urllib.request.urlopen(req, timeout=600)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            body = json.loads(body).get("error", {}).get("message", body)
+        except (ValueError, AttributeError):
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {body}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"connection failed: {e.reason}") from None
+
+
+class tracked:
+    """Context manager around an API response: registered in STREAMS while open."""
+
+    def __init__(self, resp):
+        self.resp = resp
+
+    def __enter__(self):
+        with STREAMS_LOCK:
+            STREAMS.add(self.resp)
+        return self.resp
+
+    def __exit__(self, *exc):
+        with STREAMS_LOCK:
+            STREAMS.discard(self.resp)
+        try:
+            self.resp.close()
+        except Exception:
+            pass
+
+
+def abort_streams():
+    """Shut down the sockets of all open API responses; blocked reads return at once."""
+    with STREAMS_LOCK:
+        resps = list(STREAMS)
+    for r in resps:
+        try:
+            sock = r.fp.raw._sock
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        except Exception:
+            pass
+
+
+def list_models():
+    with request("/models") as r:
+        data = json.load(r)["data"]
+    return sorted(data, key=lambda m: (m.get("mode") == "embedding", m["id"].lower()))
+
+
+def stream_reply(model, messages, tools, tool_choice=None):
+    """Yield ("text", chunk) events, then ("done", (tool_calls, usage))."""
+    payload = {"model": model, "messages": messages, "stream": True,
+               "stream_options": {"include_usage": True}}
+    if tools:
+        payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
+    calls, by_index, usage = [], {}, None
+    with tracked(request("/chat/completions", payload)) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            if chunk.get("error"):
+                raise RuntimeError(str(chunk["error"]))
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    yield "text", delta["content"]
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", len(calls) - 1 if calls and not tc.get("id") else len(calls))
+                    entry = by_index.get(idx)
+                    if entry is None or (tc.get("id") and entry["id"] and tc["id"] != entry["id"]):
+                        entry = {"id": "", "name": "", "arguments": ""}
+                        by_index[idx] = entry
+                        calls.append(entry)
+                    if tc.get("id"):
+                        entry["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    entry["name"] += fn.get("name") or ""
+                    entry["arguments"] += fn.get("arguments") or ""
+                    if fn.get("arguments"):
+                        yield "tool", (entry["name"], fn["arguments"])
+    yield "done", (calls, usage)
+
+
+def est_tokens(s):
+    return max(1, len(s) // 4)
+
+
+# ================================================================ permissions
+
+class Denied(Exception):
+    pass
+
+
+class ToolError(Exception):
+    pass
+
+
+class Permissions:
+    def __init__(self, mode="manual"):
+        self.mode = mode
+        self.always = set()
+
+    def cycle(self):
+        self.mode = MODES[(MODES.index(self.mode) + 1) % len(MODES)]
+        return self.mode
+
+    def auto_ok(self, kind):
+        if self.mode == "auto":
+            return kind != "read"           # secret files always ask
+        return self.mode == "accept-edits" and kind == "edit"
+
+    def check(self, kind, question, title="Permission", body=None, detail=None):
+        """kind: 'edit', 'bash', 'read' or 'fetch:<host>'. Raises Denied unless approved.
+        Holds IO so the prompt isn't interleaved with sub-agent output."""
+        with IO:
+            if CANCEL.is_set():
+                raise Denied("Cancelled.")
+            if kind in self.always:
+                return
+            if self.auto_ok(kind):
+                if kind == "edit" and body is not None:
+                    say(body)               # still show what changed
+                return
+            label = getattr(_tls, "label", "")
+            always = "for this site" if kind.startswith("fetch:") else {
+                "edit": "for file edits", "bash": "for commands", "read": "for sensitive files"}.get(kind, "")
+            if RICH:
+                items = []
+                if body is not None:
+                    items += [body, Text("")]
+                items += [Text(question, style="bold"),
+                          Text.assemble(("  1. ", GOLD), "Yes"),
+                          Text.assemble(("  2. ", GOLD), f"Yes, and don't ask again {always} this session"),
+                          Text.assemble(("  3. ", GOLD), "No, and tell tai what to do differently")]
+                ttl = Text.assemble((f" {label} › " if label else " ", GREY), (title + " ", f"bold {GOLD}"))
+                console.print(Panel(Group(*items), title=ttl, title_align="left", box=box.ROUNDED,
+                                    border_style=GOLD, padding=(0, 1)))
+            else:
+                if body is not None:
+                    print(body)
+                print(f"{question}  1 = yes, 2 = always {always}, 3 = no")
+            while True:
+                try:
+                    ans = input("  ❯ ").strip().lower()
+                except EOFError:
+                    raise Denied("No terminal available to approve this action.")
+                if ans in ("1", "y", "yes", "2", "a", "always", "3", "n", "no"):
+                    break
+                say("  type 1, 2 or 3", GREY)
+            if ans in ("2", "a", "always"):
+                self.always.add(kind)
+                return
+            if ans in ("1", "y", "yes"):
+                return
+            try:
+                why = input("  What should tai do instead? (Enter to skip) ❯ ").strip()
+            except EOFError:
+                why = ""
+            raise Denied(why)
+
+
+# ================================================================ file tools
+
+def resolve(p):
+    path = Path(os.path.expanduser(str(p)))
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.resolve()
+
+
+def show_path(path):
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path).replace(str(HOME), "~", 1)
+
+
+def is_sensitive(path):
+    if path.name.startswith(".env"):
+        return True
+    return any(path == s or s in path.parents for s in SENSITIVE)
+
+
+def is_binary(path):
+    try:
+        with open(path, "rb") as f:
+            return b"\0" in f.read(8192)
+    except OSError:
+        return False
+
+
+def decode(data):
+    """bytes -> (text with \\n line ends, encoding, newline) so edits can be written back the same way."""
+    nl = "\r\n" if data.count(b"\r\n") * 2 > data.count(b"\n") else "\n"
+    for enc in ("utf-8-sig" if data.startswith(b"\xef\xbb\xbf") else "utf-8", "cp1252", "latin-1"):
+        try:
+            text = data.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    return text.replace("\r\n", "\n").replace("\r", "\n"), enc, nl
+
+
+def text_format(path):
+    """(encoding, newline) of an existing file, defaults for a new one."""
+    try:
+        with open(path, "rb") as f:
+            return decode(f.read())[1:]
+    except OSError:
+        return "utf-8", "\n"
+
+
+def write_text(path, text, fmt=("utf-8", "\n")):
+    enc, nl = fmt
+    try:
+        data = text.replace("\r\n", "\n").replace("\n", nl).encode(enc)
+    except UnicodeEncodeError as e:
+        raise ToolError(f"{show_path(path)} is saved as {enc}, which cannot store "
+                        f"{e.object[e.start:e.end]!r}; use characters that exist in {enc}")
+    path.write_bytes(data)
+
+
+def read_text(path):
+    try:
+        return decode(path.read_bytes())[0]
+    except FileNotFoundError:
+        raise ToolError(f"file not found: {show_path(path)}")
+    except IsADirectoryError:
+        raise ToolError(f"{show_path(path)} is a directory (use list_files)")
+    except OSError as e:
+        raise ToolError(f"cannot read {show_path(path)}: {e.strerror}")
+
+
+def tool_read_file(a, perms):
+    path = resolve(a["path"])
+    if is_sensitive(path):
+        perms.check("read", "This file may contain secrets. Send it to the model?",
+                    "Read sensitive file", show_path(path), detail={"type": "read", "path": str(path)})
+    if path.is_file() and path.suffix.lower() == ".pdf":
+        text = pdf_to_text(path.read_bytes())
+        lines = text.splitlines()
+    else:
+        if path.is_file() and is_binary(path):
+            raise ToolError(f"{show_path(path)} is a binary file")
+        lines = read_text(path).splitlines()
+    start = max(int(a.get("offset") or 1), 1)
+    limit = int(a.get("limit") or 2000)
+    chunk = lines[start - 1: start - 1 + limit]
+    body = "\n".join(f"{n:>6}\t{l[:2000]}" for n, l in enumerate(chunk, start))
+    more = len(lines) - (start - 1 + len(chunk))
+    if more > 0:
+        body += f"\n[... {more} more lines; use offset={start + len(chunk)} to continue]"
+    return body or "(empty file)", f"Read {len(chunk)} lines"
+
+
+def walk_files(base, name_glob=None):
+    if base.is_file():
+        yield base
+        return
+    for root, dirs, files in os.walk(base):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        for f in sorted(files):
+            if name_glob is None or fnmatch.fnmatch(f, name_glob):
+                yield Path(root) / f
+
+
+def tool_list_files(a, perms):
+    base = resolve(a.get("path") or ".")
+    if not base.is_dir():
+        raise ToolError(f"not a directory: {show_path(base)}")
+    pattern = a.get("pattern") or "*"
+    out = []
+    for p in base.glob(pattern):
+        if SKIP_DIRS.intersection(p.relative_to(base).parts):
+            continue
+        out.append(p.relative_to(base).as_posix() + ("/" if p.is_dir() else ""))
+        if len(out) >= 1000:
+            break
+    out.sort()
+    body = "\n".join(out) if out else "(no matches)"
+    if len(out) >= 1000:
+        body += "\n[truncated at 1000 entries; use a narrower pattern]"
+    return body, f"{len(out)} entries"
+
+
+def tool_grep(a, perms):
+    try:
+        rx = re.compile(a["pattern"], re.I if a.get("ignore_case") else 0)
+    except re.error as e:
+        raise ToolError(f"bad regex: {e}")
+    base = resolve(a.get("path") or ".")
+    if not base.exists():
+        raise ToolError(f"no such path: {show_path(base)}")
+    hits = []
+    for f in walk_files(base, a.get("glob")):
+        if is_sensitive(f) or is_binary(f):
+            continue
+        try:
+            if f.stat().st_size > 5_000_000:
+                continue
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for n, line in enumerate(fh, 1):
+                    if rx.search(line):
+                        hits.append(f"{show_path(f)}:{n}: {line.rstrip()[:300]}")
+                        if len(hits) >= 300:
+                            break
+        except OSError:
+            continue
+        if len(hits) >= 300:
+            break
+    body = "\n".join(hits) if hits else "(no matches)"
+    if len(hits) >= 300:
+        body += "\n[stopped at 300 matches; narrow the search]"
+    return body, f"{len(hits)} matches"
+
+
+ADD_BG, DEL_BG = "on #1f3d24", "on #4a1f22"   # dark green / dark red, readable in any theme
+
+
+def diff_view(old, new, label, max_lines=120):
+    """Claude-Code-style diff: line numbers, colored backgrounds. Returns a renderable (or str)."""
+    old_l, new_l = ([] if old is None else old.splitlines()), new.splitlines()
+    rows = []   # (old_no, new_no, sign, text)
+    for line in difflib.unified_diff(old_l, new_l, lineterm="", n=2):
+        if line.startswith(("---", "+++")):
+            continue
+        if line.startswith("@@"):
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)", line)
+            o, n = int(m.group(1)), int(m.group(2))
+            if rows:
+                rows.append((None, None, "…", ""))
+            continue
+        sign, text = line[0], line[1:]
+        if sign == "-":
+            rows.append((o, None, "-", text)); o += 1
+        elif sign == "+":
+            rows.append((None, n, "+", text)); n += 1
+        else:
+            rows.append((o, n, " ", text)); o += 1; n += 1
+    added = sum(r[2] == "+" for r in rows)
+    removed = sum(r[2] == "-" for r in rows)
+    head = (f"{label}  (new file, {added} lines)" if old is None
+            else f"{label}  (+{added} −{removed})")
+    if not RICH:
+        return head + "\n" + "\n".join(f"{r[2]} {r[3]}" for r in rows[:max_lines])
+    out = [Text(head, style="bold")]
+    width = max(len(str(len(new_l))), len(str(len(old_l))), 2)
+    for o, n, sign, text in rows[:max_lines]:
+        if sign == "…":
+            out.append(Text(" " * width + "  ⋮", style=GREY))
+            continue
+        num = str(n if n is not None else o).rjust(width)
+        style = ADD_BG if sign == "+" else DEL_BG if sign == "-" else ""
+        t = Text.assemble((num + " ", GREY), (f"{sign} {text}", style))
+        t.no_wrap, t.overflow = True, "ellipsis"
+        out.append(t)
+    if len(rows) > max_lines:
+        out.append(Text(f"… {len(rows) - max_lines} more lines", style=GREY))
+    return Group(*out)
+
+
+def write_after_approval(path, old, new, perms, verb):
+    label = show_path(path)
+    if old is not None and old == new:
+        raise ToolError("the new content is identical to the current file")
+    detail = {"type": "edit", "path": str(path), "old": old, "new": new}
+    if old is None:
+        perms.check("edit", f"Create {label}?", "Create file", diff_view(None, new, label), detail=detail)
+    else:
+        perms.check("edit", f"{verb} {label}?", "Edit file", diff_view(old, new, label), detail=detail)
+    try:
+        now = read_text(path) if path.exists() else None
+    except ToolError:
+        now = None
+    if now != old:
+        raise ToolError(f"{label} changed while waiting for approval; read it again before editing")
+    fmt = text_format(path) if old is not None else ("utf-8", "\n")
+    if IO_HOOKS["before_write"]:
+        IO_HOOKS["before_write"](path, old)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(path, new, fmt)
+    except OSError as e:
+        raise ToolError(f"cannot write {label}: {e.strerror}")
+    if IO_HOOKS["after_write"]:
+        IO_HOOKS["after_write"](path, old, new)
+
+
+def tool_write_file(a, perms):
+    path = resolve(a["path"])
+    old = read_text(path) if path.exists() else None
+    write_after_approval(path, old, a["content"], perms, "Overwrite")
+    return f"Wrote {show_path(path)}", f"{'Created' if old is None else 'Overwrote'} {show_path(path)}"
+
+
+def tool_edit_file(a, perms):
+    path = resolve(a["path"])
+    old = read_text(path)
+    find, repl = a["old_string"], a["new_string"]
+    count = old.count(find) if find else 0
+    if count == 0:
+        raise ToolError("old_string not found in file (it must match exactly, including whitespace); "
+                        "read the file again")
+    if count > 1 and not a.get("replace_all"):
+        raise ToolError(f"old_string occurs {count} times; add more context to make it unique, "
+                        "or set replace_all")
+    new = old.replace(find, repl) if a.get("replace_all") else old.replace(find, repl, 1)
+    write_after_approval(path, old, new, perms, "Apply this edit to")
+    return f"Edited {show_path(path)}", f"Updated {show_path(path)}"
+
+
+def tool_bash(a, perms):
+    cmd = a["command"]
+    body = Text(cmd.strip(), style="bold") if RICH else cmd
+    perms.check("bash", "Run this command?", f"{SHELL_LABEL} command", body,
+                detail={"type": "bash", "command": cmd, "shell": SHELL_LABEL})
+    timeout = min(max(int(a.get("timeout") or 120), 1), 600)
+    with working(f"Running {clip(cmd, 50)}…"):
+        return _run_bash(cmd, timeout)
+
+
+def shell_argv(cmd):
+    if WINDOWS:
+        # PowerShell; make its own output UTF-8 so we can decode it
+        exe = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+        pre = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8; "
+        return [exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", pre + cmd]
+    return [shutil.which("bash") or "/bin/sh", "-c", cmd]
+
+
+def kill_tree(proc):
+    try:
+        if WINDOWS:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _run_bash(cmd, timeout):
+    env = {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
+    extra = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS
+             else {"start_new_session": True})
+    proc = subprocess.Popen(shell_argv(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                            env=env, **extra)
+    note, deadline = "", time.time() + timeout
+    try:
+        while True:
+            try:
+                out, _ = proc.communicate(timeout=0.3)
+                break
+            except subprocess.TimeoutExpired:
+                if CANCEL.is_set() or time.time() > deadline:
+                    kill_tree(proc)
+                    out, _ = proc.communicate()
+                    note = ("\n[killed: cancelled by the user]" if CANCEL.is_set()
+                            else f"\n[killed: timed out after {timeout}s]")
+                    break
+    except KeyboardInterrupt:
+        kill_tree(proc)
+        proc.communicate()
+        raise
+    out = (out or "").rstrip()
+    lines = out.splitlines()
+    preview = "\n".join(lines[:5]) if lines else "(no output)"
+    if len(lines) > 5:
+        preview += f"\n… +{len(lines) - 5} lines"
+    if proc.returncode:
+        preview += f"\n[exit code {proc.returncode}]"
+    return f"{out}{note}\n[exit code {proc.returncode}]", preview + note
+
+
+# ================================================================ web tools
+
+def tool_web_search(a, perms):
+    query = a["query"]
+    payload = {"model": SEARCH_MODEL, "tools": [{"type": "web_search"}],
+               "input": f"Search the web for: {query}\n\nToday is {datetime.date.today():%d %B %Y}. "
+                        "Report the relevant findings factually and in detail (numbers, dates, names, "
+                        "exact titles), and cite your sources."}
+    try:
+        with working(f"Searching the web for {clip(query, 50)}…"), tracked(request("/responses", payload)) as r:
+            d = json.load(r)
+    except RuntimeError as e:
+        raise ToolError(f"search failed: {e}")
+    texts, sources = [], {}
+    for item in d.get("output") or []:
+        if item.get("type") != "message":
+            continue
+        for c in item.get("content") or []:
+            if c.get("text"):
+                texts.append(c["text"])
+            for an in c.get("annotations") or []:
+                if an.get("url"):
+                    sources.setdefault(an["url"], an.get("title") or an["url"])
+    body = "\n".join(texts) or "(no results)"
+    if sources:
+        body += "\n\nSources:\n" + "\n".join(f"- {t}: {u}" for u, t in sources.items())
+    return body, f"{len(sources)} sources"
+
+
+class _HTMLText(HTMLParser):
+    SKIP = {"script", "style", "noscript", "svg", "template", "iframe", "head"}
+    BLOCK = {"p", "div", "br", "li", "tr", "section", "article", "header", "footer", "table",
+             "ul", "ol", "pre", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "dt", "dd",
+             "figcaption", "main", "nav", "aside", "hr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out, self.skip = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self.skip += 1
+        elif tag in self.BLOCK:
+            self.out.append("\n")
+            if tag in ("h1", "h2", "h3"):
+                self.out.append("#" * int(tag[1]) + " ")
+            elif tag == "li":
+                self.out.append("- ")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP:
+            self.skip = max(0, self.skip - 1)
+        elif tag in self.BLOCK:
+            self.out.append("\n")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(data)
+
+
+def html_to_text(html):
+    p = _HTMLText()
+    try:
+        p.feed(html)
+        p.close()
+    except Exception:
+        pass
+    lines, blank = [], False
+    for l in "".join(p.out).splitlines():
+        l = " ".join(l.split())
+        if l:
+            lines.append(l)
+            blank = False
+        elif not blank:
+            lines.append("")
+            blank = True
+    return "\n".join(lines).strip()
+
+
+def pdf_to_text(data):
+    exe = shutil.which("pdftotext")
+    if not exe:
+        raise ToolError("this is a PDF and pdftotext is not installed")
+    with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+        f.write(data)
+        f.flush()
+        r = subprocess.run([exe, "-layout", f.name, "-"], capture_output=True, text=True,
+                           errors="replace", timeout=120)
+    if r.returncode:
+        raise ToolError(f"pdftotext failed: {r.stderr.strip()[:200]}")
+    return r.stdout
+
+
+def tool_web_fetch(a, perms):
+    url = a["url"].strip()
+    if not re.match(r"https?://", url, re.I):
+        raise ToolError("only http:// and https:// URLs are supported")
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    perms.check(f"fetch:{host}", f"Fetch this page from {host}?", "Fetch",
+                Text(url, style="bold") if RICH else url, detail={"type": "fetch", "url": url, "host": host})
+    with working(f"Fetching {host}…"):
+        return _fetch(a, url, host)
+
+
+def _fetch(a, url, host):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) tai/1.0",
+        "Accept": "text/html,application/xhtml+xml,application/pdf,text/plain;q=0.9,*/*;q=0.5"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            ctype = resp.headers.get_content_type()
+            charset = resp.headers.get_content_charset() or "utf-8"
+            data = resp.read(15_000_000)
+            final = resp.geturl()
+    except urllib.error.HTTPError as e:
+        raise ToolError(f"HTTP {e.code} from {host}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise ToolError(f"cannot fetch {host}: {getattr(e, 'reason', e)}")
+    if ctype == "application/pdf" or data[:5] == b"%PDF-":
+        text, kind = pdf_to_text(data), "PDF"
+    else:
+        raw = data.decode(charset, errors="replace")
+        if "html" in ctype or raw.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
+            text, kind = html_to_text(raw), "page"
+        elif ctype.startswith("text/") or ctype.endswith(("json", "xml", "csv")):
+            text, kind = raw, ctype
+        else:
+            raise ToolError(f"unsupported content type: {ctype}")
+    limit = int(a.get("max_chars") or 25_000)
+    start = max(int(a.get("offset") or 0), 0)
+    part = text[start:start + limit]
+    body = f"URL: {final}\n\n{part}"
+    if start + limit < len(text):
+        body += f"\n\n[... {len(text) - start - limit} more characters; use offset={start + limit}]"
+    return body, f"{kind}, {human(len(text))} chars"
+
+
+# ================================================================ tool registry
+
+def fn(name, desc, props, required):
+    return {"type": "function", "function": {"name": name, "description": desc, "parameters": {
+        "type": "object", "properties": props, "required": required}}}
+
+
+S = {"type": "string"}
+# The shell tool: bash on Linux/macOS, PowerShell on Windows (named so the model writes the right syntax).
+SHELL_TOOL, SHELL_LABEL = ("powershell", "PowerShell") if WINDOWS else ("bash", "Bash")
+TOOLS = [
+    fn("read_file", "Read a text or PDF file; returns numbered lines. Use offset/limit for long files.",
+       {"path": S, "offset": {"type": "integer", "description": "1-based first line"},
+        "limit": {"type": "integer", "description": "max lines, default 2000"}}, ["path"]),
+    fn("list_files", "List files and folders matching a glob pattern such as '*', '**/*.py' or "
+       "'data/*.csv'. Skips .git, node_modules and similar.",
+       {"pattern": S, "path": {"type": "string", "description": "base directory, default: current"}},
+       ["pattern"]),
+    fn("grep", "Search file contents with a Python regular expression; returns file:line: text.",
+       {"pattern": S, "path": {"type": "string", "description": "file or directory, default: current"},
+        "glob": {"type": "string", "description": "only file names matching this, e.g. '*.tex'"},
+        "ignore_case": {"type": "boolean"}}, ["pattern"]),
+    fn("write_file", "Create a file, or overwrite one completely. Requires user approval. "
+       "For changes to existing files prefer edit_file.", {"path": S, "content": S}, ["path", "content"]),
+    fn("edit_file", "Replace an exact piece of text in a file. old_string must match exactly once "
+       "(including whitespace) unless replace_all is true. Read the file first. Requires user approval.",
+       {"path": S, "old_string": S, "new_string": S, "replace_all": {"type": "boolean"}},
+       ["path", "old_string", "new_string"]),
+    fn(SHELL_TOOL, f"Run a {SHELL_LABEL} command in the current directory; returns combined "
+       "stdout/stderr and the exit code. Requires user approval. Non-interactive: never run commands "
+       "that wait for input.",
+       {"command": S, "timeout": {"type": "integer", "description": "seconds, default 120, max 600"}},
+       ["command"]),
+    fn("web_search", "Search the web. Returns a summary of findings with source URLs. Use for current "
+       "information, facts you are unsure about, papers, documentation. One focused query per call; "
+       "several calls in one reply run back to back.",
+       {"query": {"type": "string", "description": "what to search for, as a specific question or query"}},
+       ["query"]),
+    fn("web_fetch", "Fetch a web page or PDF by URL and return its text. Use after web_search to read "
+       "a source in full. Requires user approval per website.",
+       {"url": S, "offset": {"type": "integer", "description": "character offset to continue from"},
+        "max_chars": {"type": "integer", "description": "default 25000"}}, ["url"]),
+    fn("task", "Start a sub-agent for a self-contained subtask, e.g. researching one question on the web, "
+       "or searching/reading many files. It has the same tools (except task), works on its own and "
+       "returns only its final report, which keeps your context small. Several task calls in the same "
+       "reply run IN PARALLEL. The sub-agent cannot see this conversation: give it a complete prompt "
+       "with all needed context and say exactly what to report back.",
+       {"description": {"type": "string", "description": "3-5 word label shown to the user"},
+        "prompt": {"type": "string", "description": "full, self-contained instructions"},
+        "model": {"type": "string", "description": "optional model id; default: your own model"}},
+       ["description", "prompt"]),
+]
+SUB_TOOLS = [t for t in TOOLS if t["function"]["name"] != "task"]
+RUNNERS = {"read_file": tool_read_file, "list_files": tool_list_files, "grep": tool_grep,
+           "write_file": tool_write_file, "edit_file": tool_edit_file, SHELL_TOOL: tool_bash,
+           "web_search": tool_web_search, "web_fetch": tool_web_fetch}
+LABELS = {"read_file": ("Read", "path"), "list_files": ("List", "pattern"), "grep": ("Grep", "pattern"),
+          "write_file": ("Write", "path"), "edit_file": ("Edit", "path"),
+          SHELL_TOOL: (SHELL_LABEL, "command"),
+          "web_search": ("WebSearch", "query"), "web_fetch": ("Fetch", "url")}
+
+
+def parse_args(call):
+    try:
+        args = json.loads(call["arguments"] or "{}")
+        return args if isinstance(args, dict) else None
+    except ValueError:
+        return None
+
+
+def run_tool(call, perms, compact=False):
+    """Run one (non-task) tool call. Returns (result_for_model, summary, style)."""
+    name = call["name"]
+    args = parse_args(call)
+    label, key = LABELS.get(name, (name, None))
+    shown = args.get(key, "") if (args and key) else ""
+    if key == "path" and isinstance(shown, str) and shown:
+        shown = show_path(resolve(shown))
+    if name == "list_files" and args and args.get("path"):
+        shown = f"{show_path(resolve(args['path']))}/{shown}"
+    if not compact:
+        say("")
+    if RICH:
+        say(Text.assemble(("● ", GOLD), (label, "bold"), (f"({clip(shown, 200)})", "")), one_line=True)
+    else:
+        say(f"● {label}({clip(shown, 200)})")
+
+    return exec_tool(call, perms)
+
+
+def exec_tool(call, perms, runners=None):
+    """Run one tool call without printing. Returns (result_for_model, summary, style)."""
+    runners = runners or RUNNERS
+    name = call["name"]
+    args = parse_args(call)
+    if name not in runners:
+        return f"Error: unknown tool '{name}'.", f"unknown tool {name}", "red"
+    if args is None:
+        return "Error: tool arguments were not valid JSON.", "invalid arguments", "red"
+    try:
+        result, summary = runners[name](args, perms)
+        style = "dim"
+    except Denied as d:
+        result = "The user denied this action." + (f" The user says: {d}" if str(d) else "")
+        summary, style = "Denied" + (f" — {d}" if str(d) else ""), "red"
+    except ToolError as e:
+        result, summary, style = f"Error: {e}", f"Error: {e}", "red"
+    except (KeyError, TypeError, ValueError) as e:
+        result, summary, style = f"Error: bad arguments ({e})", f"bad arguments ({e})", "red"
+    if len(result) > MAX_TOOL_OUTPUT:
+        half = MAX_TOOL_OUTPUT // 2
+        result = (result[:half] + f"\n[... {len(result) - MAX_TOOL_OUTPUT} characters omitted ...]\n"
+                  + result[-half:])
+    return result, summary, style
+
+
+def print_summary(summary, style):
+    style = GREY if style == "dim" else style
+    lines = summary.splitlines() or [""]
+    say("  ⎿  " + lines[0], style)
+    for l in lines[1:]:
+        say("     " + l, style)
+
+
+# ================================================================ sub-agents
+
+def subagent(args, label, perms, model):
+    """Run a sub-agent to completion in this thread; return its final report."""
+    _tls.prefix = f"  │ {label}: "
+    _tls.label = label
+    msgs = [{"role": "system", "content": system_prompt(True, sub=True)},
+            {"role": "user", "content": args["prompt"]}]
+    uses = tokens = streamed = 0
+    text = ""
+    try:
+        for _ in range(SUB_MAX_STEPS):
+            if CANCEL.is_set():
+                return "Sub-agent stopped: the user interrupted." + (f" Notes so far: {text}" if text else "")
+            text, calls, usage = "", [], None
+            gen = stream_reply(model, msgs, SUB_TOOLS)
+            try:
+                for kind, val in gen:
+                    if CANCEL.is_set():
+                        break
+                    if kind == "text":
+                        text += val
+                        USAGE.stream(est_tokens(val)); streamed += est_tokens(val)
+                    elif kind == "tool":
+                        USAGE.stream(est_tokens(val[1])); streamed += est_tokens(val[1])
+                    else:
+                        calls, usage = val
+            finally:
+                gen.close()
+                USAGE.stream(-streamed)
+                streamed = 0
+            if CANCEL.is_set():
+                continue
+            USAGE.add(usage)
+            if usage:
+                tokens += (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)
+            assistant = {"role": "assistant", "content": text or None}
+            if calls:
+                for i, c in enumerate(calls):
+                    c["id"] = c["id"] or f"call_{uses}_{i}"
+                assistant["tool_calls"] = [{"id": c["id"], "type": "function", "function": {
+                    "name": c["name"], "arguments": c["arguments"] or "{}"}} for c in calls]
+            msgs.append(assistant)
+            if not calls:
+                dim(f"done · {uses} tool uses · {human(tokens)} tokens")
+                return text or "(the sub-agent returned no report)"
+            for c in calls:
+                if CANCEL.is_set():
+                    result = "Not run: the user interrupted."
+                else:
+                    result, summary, style = run_tool(c, perms, compact=True)
+                    uses += 1
+                    if style == "red":
+                        print_summary(summary, style)
+                msgs.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+        return f"Sub-agent stopped after {SUB_MAX_STEPS} steps. Last notes: {text}"
+    except RuntimeError as e:
+        err(f"failed: {e}")
+        return f"Sub-agent failed: {e}"
+    finally:
+        _tls.prefix = _tls.label = ""
+
+
+def run_tasks(tasks, perms, model):
+    """Run task calls in parallel. Returns {call_id: result}."""
+    results, jobs = {}, []
+    for i, c in enumerate(tasks):
+        a = parse_args(c)
+        if not a or not a.get("prompt"):
+            say(f"\n● Task(?)", "bold magenta")
+            print_summary("Error: a task needs a prompt", "red")
+            results[c["id"]] = "Error: the task tool needs a 'prompt'."
+            continue
+        label = clip(a.get("description") or a["prompt"], 30)
+        say("")
+        if RICH:
+            say(Text.assemble(("● ", BLUE), ("Task", "bold"), (f"({label})", "")), one_line=True)
+            say(Text("  ⎿  " + clip(a["prompt"], 300), style=GREY), one_line=True)
+        else:
+            say(f"● Task({label})\n  ⎿  {clip(a['prompt'], 110)}")
+        jobs.append((c, a, f"{i + 1}·{clip(label, 18)}" if len(tasks) > 1 else clip(label, 22)))
+    if not jobs:
+        return results
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL_AGENTS)
+    futures = {pool.submit(subagent, a, label, perms, a.get("model") or model): c
+               for c, a, label in jobs}
+    pending = set(futures)
+    while pending:
+        try:
+            _, pending = concurrent.futures.wait(pending, timeout=0.2)
+        except KeyboardInterrupt:
+            if not CANCEL.is_set():
+                CANCEL.set()
+                err("\n[stopping sub-agents… press Enter if an approval prompt is open]")
+    pool.shutdown()
+    for fut, c in futures.items():
+        try:
+            results[c["id"]] = fut.result()
+        except Exception as e:  # never let one sub-agent crash the session
+            results[c["id"]] = f"Sub-agent crashed: {e}"
+    return results
+
+
+def execute_calls(calls, perms, model):
+    """Run the tool calls of one model reply; task calls run in parallel at the end."""
+    results = {}
+    tasks = [c for c in calls if c["name"] == "task"]
+    for c in calls:
+        if c["name"] == "task":
+            continue
+        if CANCEL.is_set():
+            results[c["id"]] = "Not run: the user interrupted."
+            continue
+        try:
+            result, summary, style = run_tool(c, perms)
+            print_summary(summary, style)
+        except KeyboardInterrupt:
+            CANCEL.set()
+            err("\n[interrupted]")
+            result = "Interrupted by the user."
+        results[c["id"]] = result
+    if tasks and not CANCEL.is_set():
+        results.update(run_tasks(tasks, perms, model))
+    return [results.get(c["id"], "Not run: the user interrupted.") for c in calls]
+
+
+# ================================================================ agent loop
+
+def system_prompt(use_tools, extra=None, sub=False, ide=False):
+    cwd = Path.cwd()
+    where = "inside Visual Studio Code (tai extension)" if ide else "in the user's terminal"
+    parts = [f"You are tai, an AI assistant running {where} on {platform.system()} "
+             f"(via the Tilburg.ai API). Today is {datetime.date.today():%A %d %B %Y}. "
+             f"Current directory: {cwd}",
+             "Today's date above is correct. Your training data ends earlier, so events up to today that "
+             "you don't know about are real, not 'future': trust dated web results over your own prior "
+             "knowledge."]
+    if sub:
+        parts.append(
+            "You are a SUB-AGENT: another AI agent gave you one focused task. Work through it on your "
+            "own with your tools. Your final message is the only thing the other agent will see (not "
+            "your tool results), so make it a complete, self-contained report: concrete findings, file "
+            "paths with line numbers, URLs of sources. Don't ask questions; if something is unclear, "
+            "make a reasonable assumption and state it. Don't edit files or run commands unless the "
+            "task asks for it.")
+    if use_tools:
+        parts.append(
+            f"You have tools to list, search and read files (including PDFs), edit and write files, run "
+            f"{SHELL_LABEL} commands, search the web and fetch web pages. Use them to find things out instead of "
+            "guessing.\n"
+            "- Work step by step. Read a file before editing it; prefer edit_file with small, exact "
+            "replacements over rewriting whole files.\n"
+            "- For current events, facts you're unsure of, papers or documentation: use web_search, "
+            "then web_fetch to read the best sources. Cite URLs in your answer.\n"
+            + ("" if sub else
+               "- For larger jobs, delegate self-contained parts to sub-agents with the task tool; "
+               "several task calls in one reply run in parallel (e.g. one per question or source).\n")
+            + f"- write_file, edit_file, {SHELL_TOOL} and web_fetch need the user's approval. If the user denies "
+            "an action, don't retry it; follow their instructions or ask.\n"
+            "- Never run destructive or irreversible commands (deleting files, git reset --hard, "
+            "overwriting data, sending data to remote services) unless the user explicitly asked.\n"
+            "- Commands run non-interactively with a timeout; don't start editors, pagers or servers.\n"
+            "- When done, say briefly what you did. Be concise; use markdown.")
+    else:
+        parts.append("Be concise; use markdown.")
+    if ide and use_tools:
+        parts.append(
+            "You are shown in a VS Code chat panel; the user sees your file edits as diffs. A user "
+            "message may start with an <ide_context> block saying which file is open in the editor and "
+            "what is selected, and with <file> blocks the user attached. Use them when relevant; don't "
+            "comment on them otherwise. After editing code, use get_diagnostics to check for errors "
+            "and warnings that VS Code reports. Refer to files with paths relative to the current "
+            "directory (with :line where useful); the user can click them.")
+    for name in ("TAI.md", "CLAUDE.md", "AGENTS.md"):
+        f = cwd / name
+        if use_tools and f.is_file():
+            parts.append(f"Project instructions from {name}:\n" + read_text(f)[:20000])
+            break
+    if extra:
+        parts.append(extra)
+    return "\n\n".join(parts)
+
+
+def stream_and_render(model, messages, tools, markdown, main=True):
+    """Stream one model reply. Returns (text, tool_calls, usage). KeyboardInterrupt propagates
+    with the partial text attached as .partial."""
+    parts = []
+    events = stream_reply(model, messages, tools)
+    calls, usage = [], None
+    view = Thinking() if RICH else None
+    streamed = 0
+
+    def progress(s):
+        nonlocal streamed
+        n = est_tokens(s)
+        streamed += n
+        USAGE.stream(n)
+        if view:
+            view.out += n
+    try:
+        if RICH and sys.stdout.isatty():
+            with Live(view, console=console, refresh_per_second=12,
+                      vertical_overflow="visible") as live:
+                for kind, val in events:
+                    if kind == "text":
+                        parts.append(val)
+                        progress(val)
+                        view.tool = ""
+                        view.body = (with_gutter(Markdown("".join(parts))) if markdown
+                                     else Text("".join(parts)))
+                    elif kind == "tool":
+                        view.tool = val[0]
+                        progress(val[1])
+                    else:
+                        calls, usage = val
+                text = "".join(parts).strip()
+                live.update(with_gutter(Markdown(text) if markdown else Text(text)) if text else Text(""))
+        else:
+            for kind, val in events:
+                if kind == "text":
+                    parts.append(val)
+                    sys.stdout.write(val)
+                    sys.stdout.flush()
+                elif kind == "done":
+                    calls, usage = val
+            if parts:
+                print()
+    except KeyboardInterrupt as e:
+        e.partial = "".join(parts)
+        raise
+    finally:
+        events.close()
+        USAGE.stream(-streamed)
+    USAGE.add(usage, main=main)
+    return "".join(parts), calls, usage
+
+
+def run_turn(conv, perms, markdown, use_tools):
+    """Run model ↔ tools until the model answers without tool calls."""
+    msgs = conv["messages"]
+    tools = TOOLS if use_tools else None
+    total_in = total_out = 0
+    start = time.time()
+    for step in range(MAX_STEPS):
+        try:
+            text, calls, usage = stream_and_render(conv["model"], msgs, tools, markdown)
+        except KeyboardInterrupt as e:
+            err("\n[interrupted]")
+            if getattr(e, "partial", ""):
+                msgs.append({"role": "assistant", "content": e.partial})
+            return
+        except RuntimeError as e:
+            err(f"tai: {e}")
+            return
+        if usage:
+            total_in += usage.get("prompt_tokens") or 0
+            total_out += usage.get("completion_tokens") or 0
+
+        assistant = {"role": "assistant", "content": text or None}
+        if calls:
+            for i, c in enumerate(calls):
+                c["id"] = c["id"] or f"call_{step}_{i}"
+            assistant["tool_calls"] = [{"id": c["id"], "type": "function", "function": {
+                "name": c["name"], "arguments": c["arguments"] or "{}"}} for c in calls]
+        elif not text:
+            assistant["content"] = "(no response)"
+        msgs.append(assistant)
+        if not calls:
+            break
+
+        results = execute_calls(calls, perms, conv["model"])
+        for c, r in zip(calls, results):
+            msgs.append({"role": "tool", "tool_call_id": c["id"], "content": r})
+        if CANCEL.is_set():
+            return
+        print()
+    else:
+        err(f"[stopped after {MAX_STEPS} steps — say 'continue' to keep going]")
+    if total_in or total_out:
+        bits = [f"{human(total_in)} in", f"{human(total_out)} out", f"{int(time.time() - start)}s"]
+        if USAGE.ctx_text():
+            bits.append(USAGE.ctx_text())
+        bits += [f"session {human(USAGE.inp + USAGE.out)}", conv["model"]]
+        dim("  " + " · ".join(bits))
+
+
+# ================================================================ conversation & REPL
+
+def read_file_block(path):
+    p = Path(path).expanduser()
+    try:
+        text = decode(p.read_bytes())[0]
+    except OSError as e:
+        raise RuntimeError(f"cannot read {path}: {e.strerror}") from None
+    return f'<file name="{p.name}">\n{text}\n</file>'
+
+
+def save_conv(conv):
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        LAST_CONV.write_text(json.dumps(conv, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_conv():
+    try:
+        return json.loads(LAST_CONV.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def to_markdown(conv):
+    out = [f"<!-- tai conversation · model: {conv['model']} -->\n"]
+    for m in conv["messages"]:
+        if m["role"] == "user":
+            out.append(f"## You\n\n{m['content']}\n")
+        elif m["role"] == "assistant":
+            if m.get("content"):
+                out.append(f"## {conv['model']}\n\n{m['content']}\n")
+            for tc in m.get("tool_calls") or []:
+                out.append(f"*→ {tc['function']['name']}* `{clip(tc['function']['arguments'], 200)}`\n")
+        elif m["role"] == "tool":
+            out.append(f"<details><summary>tool result</summary>\n\n```\n{m['content'][:3000]}\n```\n"
+                       "</details>\n")
+    return "\n".join(out)
+
+
+HELP = """Commands:
+  /model [name]   show or switch model        /models   list models
+  /tools          toggle agent tools on/off   /clear    start a new conversation
+  /system [text]  show or add instructions    /save PATH  save conversation as markdown
+  /file PATH      attach a file to your next message
+  /btw QUESTION   quick side question; answer is not added to the conversation
+  /mode [name]    show or set permission mode (manual, accept-edits, auto)
+  /usage          token usage this session
+  /help           this help                   /exit     quit (or Ctrl+C twice, or Ctrl+D)
+Alt+Enter inserts a new line (pasting multi-line text also works).
+Shift+Tab cycles the permission mode (manual → accept-edits → auto).
+Ctrl+C stops the current reply, command or sub-agents; at an empty prompt, twice quits.
+Approvals: y = once, a = always this session (for web_fetch: always for that site)."""
+
+
+def read_input(prompt):
+    line = input(prompt)
+    if not line.lstrip().startswith('"""'):
+        return line
+    first = line.lstrip()[3:]
+    if first.rstrip().endswith('"""') and first.strip():
+        return first.rstrip()[:-3]
+    lines = [first] if first else []
+    while True:
+        nxt = input("… ")
+        if nxt.rstrip().endswith('"""'):
+            lines.append(nxt.rstrip()[:-3])
+            return "\n".join(lines).strip()
+        lines.append(nxt)
+
+
+def new_conv(model, use_tools, extra_system=None):
+    return {"model": model, "tools": use_tools, "extra_system": extra_system,
+            "messages": [{"role": "system", "content": system_prompt(use_tools, extra_system)}]}
+
+
+def reset_system(conv):
+    msgs = [m for m in conv["messages"] if m["role"] != "system"]
+    conv["messages"] = [{"role": "system",
+                         "content": system_prompt(conv["tools"], conv.get("extra_system"))}] + msgs
+
+
+def ask(conv, perms, markdown, content):
+    CANCEL.clear()
+    before = len(conv["messages"])
+    conv["messages"].append({"role": "user", "content": content})
+    print()
+    run_turn(conv, perms, markdown, conv["tools"])
+    if len(conv["messages"]) == before + 1:     # request failed before any reply: allow retry
+        conv["messages"].pop()
+        return False
+    save_conv(conv)
+    return True
+
+
+def btw(conv, markdown, question):
+    """Answer a side question with the conversation as context, without changing it."""
+    CANCEL.clear()
+    msgs = conv["messages"] + [{"role": "user", "content":
+        "[Side question — answer briefly from what you already know and the conversation so far. "
+        "Do not call any tools; this exchange will not be kept in the conversation.]\n\n" + question}]
+    tools = TOOLS if conv["tools"] else None   # keep the tool schema so earlier tool calls stay valid
+    print()
+    try:
+        text, _, _ = stream_and_render(conv["model"], msgs, tools, markdown, main=False)
+    except KeyboardInterrupt:
+        err("\n[interrupted]")
+        return
+    except RuntimeError as e:
+        err(f"tai: {e}")
+        return
+    if not text.strip():
+        dim("(no answer)")
+    dim("  /btw · not added to the conversation")
+
+
+COMMANDS = [("/help", "show commands"), ("/model", "show or switch model"), ("/models", "list models"),
+            ("/tools", "toggle agent tools on/off"), ("/clear", "start a new conversation"),
+            ("/system", "show or set extra instructions"), ("/file", "attach a file to your next message"),
+            ("/save", "save conversation as markdown"), ("/btw", "side question, not kept in the conversation"),
+            ("/mode", "show or set permission mode (shift+tab cycles)"), ("/usage", "token usage this session"),
+            ("/exit", "quit")]
+
+
+def make_reader(conv, perms):
+    """Return a function that reads one user message (raises EOFError to quit).
+    Ctrl+C clears the line; on an empty line, Ctrl+C twice within 2 s quits."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state = {"ctrl_c": 0.0}
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.completion import Completer, Completion
+        from prompt_toolkit.formatted_text import FormattedText
+        from prompt_toolkit.history import FileHistory
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.styles import Style
+    except ImportError:
+        return _readline_reader(state)
+
+    class Slash(Completer):
+        def get_completions(self, document, event):
+            t = document.text_before_cursor
+            if t.startswith("/") and " " not in t:
+                for cmd, desc in COMMANDS:
+                    if cmd.startswith(t):
+                        yield Completion(cmd, start_position=-len(t), display_meta=desc)
+
+    kb = KeyBindings()
+
+    @kb.add("c-c")
+    def _(event):
+        buf = event.app.current_buffer
+        if buf.text:
+            buf.reset()
+            state["ctrl_c"] = 0.0
+        elif time.time() - state["ctrl_c"] < 2:
+            event.app.exit(exception=EOFError())
+        else:
+            state["ctrl_c"] = time.time()
+            event.app.invalidate()
+
+    @kb.add("escape", "enter")
+    def _(event):
+        event.current_buffer.insert_text("\n")
+
+    @kb.add("s-tab")
+    def _(event):
+        perms.cycle()
+        event.app.invalidate()
+
+    def cols():
+        return shutil.get_terminal_size((80, 24)).columns
+
+    def message():
+        return FormattedText([("class:rule", "─" * cols() + "\n"), ("class:prompt", "❯ ")])
+
+    def toolbar():
+        rule = ("class:rule", "─" * cols() + "\n")
+        if time.time() - state["ctrl_c"] < 2:
+            return FormattedText([rule, ("class:warn", "  Press Ctrl+C again to exit")])
+        where = short_path(Path.cwd(), 32)
+        mode = "agent" if conv["tools"] else "chat"
+        line = [rule, ("class:model", f"  {conv['model']}"), ("class:hint", f" · {mode} · {where}")]
+        used = USAGE.inp + USAGE.out
+        if used:
+            line.append(("class:hint", f" · {human(used)} tokens"))
+        if USAGE.ctx_text():
+            line.append(("class:hint", f" · {USAGE.ctx_text()}"))
+        line.append(("class:rule", "\n"))
+        if conv["tools"]:
+            cls = {"manual": "class:hint", "accept-edits": "class:modeedit", "auto": "class:modeauto"}[perms.mode]
+            icon = {"manual": "  ⏸ manual", "accept-edits": "  ⏵ accept edits", "auto": "  ⏵⏵ auto"}[perms.mode]
+            line += [(cls, icon), ("class:hint", " (shift+tab to cycle)")]
+        else:
+            line.append(("class:hint", "  chat mode"))
+        line.append(("class:hint", "   / commands · alt+enter newline · ctrl+c ×2 quit"))
+        return FormattedText(line)
+
+    style = Style.from_dict({
+        "rule": "#5a5a5a", "prompt": f"{GOLD} bold", "model": GOLD, "hint": "#8a8a8a",
+        "warn": "#e0a040 bold", "modeedit": f"{BLUE} bold", "modeauto": "#d0605a bold",
+        "bottom-toolbar": "noreverse bg:default",
+        "completion-menu.completion": "bg:#2b2b2b #d0d0d0",
+        "completion-menu.completion.current": f"bg:{GOLD} #000000",
+        "completion-menu.meta.completion": "bg:#2b2b2b #8a8a8a",
+        "completion-menu.meta.completion.current": f"bg:{GOLD} #000000"})
+    session = PromptSession(history=FileHistory(str(HISTORY)), completer=Slash(),
+                            complete_while_typing=True, key_bindings=kb, bottom_toolbar=toolbar,
+                            style=style, refresh_interval=0.5)
+
+    def read():
+        print()
+        return session.prompt(message)
+    return read
+
+
+def _readline_reader(state):
+    try:
+        import readline
+        try:
+            readline.read_history_file(HISTORY)
+        except OSError:
+            pass
+        readline.set_history_length(2000)
+        import atexit
+        atexit.register(lambda: readline.write_history_file(HISTORY))
+    except (ImportError, OSError):
+        pass
+
+    def read():
+        while True:
+            try:
+                return read_input("\n❯ ")
+            except KeyboardInterrupt:
+                if time.time() - state["ctrl_c"] < 2:
+                    raise EOFError
+                state["ctrl_c"] = time.time()
+                print("\n  (press Ctrl+C again to exit)")
+    return read
+
+
+def model_window(model):
+    """Look up the model's context window in the background (for the ctx % display)."""
+    def look():
+        try:
+            for m in list_models():
+                if m["id"] == model:
+                    USAGE.max_ctx = m.get("max_input_tokens")
+                    return
+            USAGE.max_ctx = None
+        except Exception:
+            pass
+    threading.Thread(target=look, daemon=True).start()
+
+
+def repl(conv, perms, markdown, pending=None):
+    pending = pending or []
+    welcome(conv, perms)
+    model_window(conv["model"])
+    reader = make_reader(conv, perms)
+    try:
+        while True:
+            try:
+                text = reader().strip()
+            except EOFError:
+                break
+            if not text:
+                continue
+
+            if text.startswith("/"):
+                cmd, _, arg = text.partition(" ")
+                arg = arg.strip()
+                if cmd in ("/exit", "/quit", "/q"):
+                    break
+                elif cmd == "/help":
+                    print(HELP)
+                elif cmd == "/models":
+                    print_models(conv["model"])
+                elif cmd == "/model":
+                    if arg:
+                        conv["model"] = arg
+                        model_window(arg)
+                    dim(f"model: {conv['model']}")
+                elif cmd == "/mode":
+                    if arg and arg not in MODES:
+                        err(f"unknown mode {arg} — use one of: {', '.join(MODES)}")
+                        continue
+                    if arg:
+                        perms.mode = arg
+                    dim(f"mode: {perms.mode} — {MODE_INFO[perms.mode]}"
+                        + ("" if arg else f"  (shift+tab or /mode {'|'.join(MODES)})"))
+                elif cmd == "/usage":
+                    dim(f"session: {human(USAGE.inp)} in · {human(USAGE.out)} out · "
+                        f"{human(USAGE.inp + USAGE.out)} total"
+                        + (f" · {USAGE.ctx_text()}" if USAGE.ctx_text() else ""))
+                elif cmd == "/btw":
+                    if not arg:
+                        err("usage: /btw QUESTION")
+                        continue
+                    btw(conv, markdown, arg)
+                elif cmd == "/tools":
+                    conv["tools"] = not conv["tools"]
+                    reset_system(conv)
+                    dim(f"tools {'on (agent mode)' if conv['tools'] else 'off (chat mode)'}")
+                elif cmd == "/clear":
+                    conv["messages"] = conv["messages"][:1]
+                    USAGE.ctx = 0
+                    pending.clear()
+                    dim("conversation cleared")
+                elif cmd == "/system":
+                    if arg:
+                        conv["extra_system"] = arg
+                        reset_system(conv)
+                        dim("instructions set")
+                    else:
+                        dim(conv.get("extra_system") or "(no extra instructions)")
+                elif cmd == "/file":
+                    try:
+                        pending.append(read_file_block(arg))
+                        dim(f"attached {arg} (sent with your next message)")
+                    except RuntimeError as e:
+                        err(str(e))
+                elif cmd == "/save":
+                    if not arg:
+                        err("usage: /save PATH")
+                        continue
+                    try:
+                        Path(arg).expanduser().write_text(to_markdown(conv), encoding="utf-8")
+                        dim(f"saved to {arg}")
+                    except OSError as e:
+                        err(f"cannot save: {e.strerror}")
+                else:
+                    err(f"unknown command {cmd} — /help")
+                continue
+
+            content = "\n\n".join(pending + [text])
+            pending.clear()
+            ask(conv, perms, markdown, content)
+    finally:
+        if len(conv["messages"]) > 1:
+            say("\n  Bye! Resume this conversation with  tai -c", GREY)
+
+
+def print_models(current=None):
+    try:
+        models = list_models()
+    except RuntimeError as e:
+        return err(f"tai: {e}")
+    for m in models:
+        mark = "*" if m["id"] == current else " "
+        ctx = m.get("max_input_tokens")
+        extra = f"  {ctx // 1000}k ctx" if ctx else ""
+        if m.get("mode") == "embedding":
+            extra += "  (embedding)"
+        print(f" {mark} {m['id']}{extra}")
+
+
+# ================================================================ IDE server (tai --serve)
+#
+# A JSON-lines protocol on stdin/stdout, used by the tai VS Code extension.
+#   client → server   {"id": n, "method": "...", "params": {...}}   answered with {"id": n, "result"|"error"}
+#   server → client   {"method": "event", "params": {"type": "...", ...}}   (notifications)
+#                     {"id": "s<n>", "method": "approval" | "ide/...", "params": {...}}   (requests the
+#                     client answers with {"id": "s<n>", "result": ...})
+# The agent loop mirrors run_turn/subagent above, but reports structured events instead of printing.
+
+PROTOCOL_VERSION = 1
+TAI_VERSION = "1.3.0"
+SESSIONS = STATE_DIR / "sessions"
+MAX_PREVIEW = 2_000_000         # larger files are not sent to the editor for diff previews
+MAX_SNAPSHOT = 5_000_000        # larger files are not snapshotted for rewind
+MAX_ATTACH = 200_000            # characters per attached file
+
+IDE_TOOLS = [
+    fn("get_diagnostics", "Get the errors and warnings VS Code currently reports (the Problems panel) "
+       "for one file, or for all files if no path is given. Use it after editing code.",
+       {"path": {"type": "string", "description": "file path; omit for all files"}}, []),
+]
+
+
+class Cancelled(Exception):
+    def __init__(self, partial=""):
+        super().__init__("cancelled")
+        self.partial = partial
+
+
+ABORTED = object()
+
+
+def pumped(model, msgs, tools, cancelled, tool_choice=None):
+    """stream_reply() events, read by a helper thread so that cancelled() takes effect at once,
+    even while the API has not answered yet. Raises Cancelled when cancelled() becomes true."""
+    q, stop = queue.Queue(), threading.Event()
+    msgs = list(msgs)
+
+    def produce():
+        gen = stream_reply(model, msgs, tools, tool_choice)
+        try:
+            for ev in gen:
+                if stop.is_set():
+                    break
+                q.put(ev)
+        except BaseException as e:      # noqa: B902 — handed to the consumer
+            q.put(("error", e))
+        finally:
+            gen.close()
+            q.put(("end", None))
+    threading.Thread(target=produce, daemon=True).start()
+    try:
+        while True:
+            try:
+                kind, val = q.get(timeout=0.05)
+            except queue.Empty:
+                if cancelled():
+                    raise Cancelled()
+                continue
+            if kind == "end":
+                return
+            if cancelled():
+                raise Cancelled()
+            if kind == "error":
+                raise val
+            yield kind, val
+    finally:
+        stop.set()
+
+
+class Proto:
+    """JSON-lines transport. Thread-safe; requests to the client block their calling thread."""
+
+    def __init__(self, out):
+        self.out = out
+        self.lock = threading.Lock()
+        self.pending = {}
+        self.n = 0
+        self.closed = threading.Event()
+
+    def send(self, obj):
+        line = json.dumps(obj)          # ASCII escapes: lone surrogates can't break the pipe
+        with self.lock:
+            try:
+                self.out.write(line + "\n")
+                self.out.flush()
+            except OSError:
+                self.closed.set()
+            except ValueError:          # stdout closed
+                self.closed.set()
+
+    def event(self, type_, **params):
+        self.send({"method": "event", "params": {"type": type_, **params}})
+
+    def reply(self, id_, result=None, error=None):
+        if error is not None:
+            self.send({"id": id_, "error": {"message": str(error)}})
+        else:
+            self.send({"id": id_, "result": result})
+
+    def request(self, method, params, timeout=None, abort=None):
+        """Ask the client and wait. Returns its result; None if it answered with an error, went
+        away or timed out; ABORTED if abort() became true (the client is told to drop the request)."""
+        ev = threading.Event()
+        slot = {}
+        with self.lock:
+            self.n += 1
+            rid = f"s{self.n}"
+            self.pending[rid] = (ev, slot)
+        self.send({"id": rid, "method": method, "params": params})
+        deadline = time.time() + timeout if timeout else None
+        try:
+            while not ev.wait(0.05):
+                if self.closed.is_set():
+                    return None
+                if abort and abort():
+                    self.event("request_cancelled", requestId=rid)
+                    return ABORTED
+                if deadline and time.time() > deadline:
+                    self.event("request_cancelled", requestId=rid)
+                    return None
+            return slot.get("result")
+        finally:
+            with self.lock:
+                self.pending.pop(rid, None)
+
+    def resolve(self, msg):
+        with self.lock:
+            entry = self.pending.get(msg.get("id"))
+        if entry:
+            ev, slot = entry
+            slot["result"] = msg.get("result") if "error" not in msg else None
+            ev.set()
+
+
+class ServerPermissions(Permissions):
+    """Approvals are asked in the editor; parallel sub-agents may wait on several at once."""
+
+    def __init__(self, proto, mode="manual"):
+        super().__init__(mode)
+        self.proto = proto
+
+    def check(self, kind, question, title="Permission", body=None, detail=None):
+        if CANCEL.is_set():
+            raise Denied("Cancelled.")
+        if kind in self.always or self.auto_ok(kind):
+            return
+        detail = dict(detail or {})
+        for k in ("old", "new"):
+            if isinstance(detail.get(k), str) and len(detail[k]) > MAX_PREVIEW:
+                detail[k] = None
+                detail["tooLarge"] = True
+        always = "for this site" if kind.startswith("fetch:") else {
+            "edit": "for file edits", "bash": "for commands", "read": "for sensitive files"}.get(kind, "")
+        res = self.proto.request("approval", {
+            "kind": kind, "title": title, "question": question, "always": always,
+            "detail": detail, "agent": getattr(_tls, "label", "")},
+            abort=lambda: CANCEL.is_set() or kind in self.always or self.auto_ok(kind))
+        if kind in self.always or self.auto_ok(kind):
+            return                  # approved meanwhile ("always" in another card, or mode changed)
+        if res is ABORTED or CANCEL.is_set():
+            raise Denied("Cancelled.")
+        if not isinstance(res, dict):
+            raise Denied("The editor did not answer the approval request.")
+        decision = res.get("decision")
+        if decision == "always":
+            self.always.add(kind)
+            return
+        if decision == "yes":
+            return
+        raise Denied(str(res.get("feedback") or "").strip())
+
+
+def describe_call(name, args):
+    """(label, shown) for a tool call, like the terminal's '● Label(shown)'."""
+    if name == "get_diagnostics":
+        p = (args or {}).get("path")
+        try:
+            return "Diagnostics", show_path(resolve(p)) if isinstance(p, str) and p else "workspace"
+        except (OSError, ValueError, RuntimeError):
+            return "Diagnostics", str(p)
+    label, key = LABELS.get(name, (name, None))
+    shown = args.get(key, "") if (args and key) else ""
+    if not isinstance(shown, str):
+        shown = str(shown)
+    try:
+        if key == "path" and shown:
+            shown = show_path(resolve(shown))
+        if name == "list_files" and args and args.get("path"):
+            shown = f"{show_path(resolve(args['path']))}/{shown}"
+    except (OSError, ValueError, RuntimeError):
+        pass
+    return label, shown
+
+
+def ui_args(args, cap=4000):
+    if not isinstance(args, dict):
+        return {}
+    return {k: (v[:cap] + "…" if isinstance(v, str) and len(v) > cap else v) for k, v in args.items()}
+
+
+def consistent_prefix(msgs):
+    """Messages up to the last point where every tool call has its result (for side requests
+    made while a turn is still running)."""
+    out, i = [], 0
+    while i < len(msgs):
+        m = msgs[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            ids = {tc["id"] for tc in m["tool_calls"]}
+            j, got = i + 1, set()
+            while j < len(msgs) and msgs[j].get("role") == "tool":
+                got.add(msgs[j].get("tool_call_id"))
+                j += 1
+            if not ids <= got:
+                break
+            out.extend(msgs[i:j])
+            i = j
+            continue
+        out.append(m)
+        i += 1
+    return out
+
+
+def clean_text(s):
+    """Replaces lone UTF-16 surrogates (e.g. half an emoji cut off by a selection limit)."""
+    s = str(s or "")
+    try:
+        s.encode("utf-8")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+
+
+def clean(obj):
+    if isinstance(obj, str):
+        return clean_text(obj)
+    if isinstance(obj, list):
+        return [clean(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: clean(v) for k, v in obj.items()}
+    return obj
+
+
+def fill_missing_results(msgs, note="Error: the tool call was not completed."):
+    """Every assistant tool call needs a tool result, or the API rejects the conversation."""
+    i = 0
+    while i < len(msgs):
+        m = msgs[i]
+        i += 1
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            continue
+        j, got = i, set()
+        while j < len(msgs) and msgs[j].get("role") == "tool":
+            got.add(msgs[j].get("tool_call_id"))
+            j += 1
+        missing = [{"role": "tool", "tool_call_id": tc["id"], "content": note}
+                   for tc in m["tool_calls"] if tc["id"] not in got]
+        msgs[j:j] = missing
+        i = j + len(missing)
+
+
+def new_session_id():
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(3).hex()}"
+
+
+def session_path(sid):
+    if not re.fullmatch(r"[\w.-]+", sid or ""):
+        raise ValueError("bad session id")
+    return SESSIONS / f"{sid}.json"
+
+
+def write_json_atomic(path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(obj), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def snapshot(path):
+    """Contents of a file before tai changes it: None (did not exist), text, or base64 bytes."""
+    import base64
+    try:
+        if not path.exists():
+            return None
+        if path.stat().st_size > MAX_SNAPSHOT:
+            return {"skipped": "too large"}
+        data = path.read_bytes()
+    except OSError as e:
+        return {"skipped": e.strerror or "unreadable"}
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"b64": base64.b64encode(data).decode()}
+
+
+def restore(path, snap):
+    import base64
+    if isinstance(snap, dict) and "skipped" in snap:
+        raise OSError(f"no snapshot ({snap['skipped']})")
+    if snap is None:
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(snap, dict):
+        path.write_bytes(base64.b64decode(snap["b64"]))
+    else:
+        path.write_bytes(snap.encode("utf-8"))      # exact bytes back, line endings included
+
+
+class Server:
+    def __init__(self, proto, model, mode):
+        self.proto = proto
+        self.perms = ServerPermissions(proto, mode)
+        self.lock = threading.RLock()
+        self.busy = False
+        self.compacting = False
+        self.inbox = []             # messages sent while a turn runs; injected at the next step
+        self.worker = None
+        self.caps = {}
+        self.cur_turn = None
+        self.streaming_text = ""
+        self.btw_cancel = {}
+        self.session = None
+        self.new_session(model, True, None)
+        IO_HOOKS["before_write"] = self._before_write
+        IO_HOOKS["after_write"] = self._after_write
+
+    # ------------------------------------------------------------ session state
+    @property
+    def conv(self):
+        return self.session["conv"]
+
+    @property
+    def ide(self):
+        return bool(self.caps.get("ide"))
+
+    def new_session(self, model, tools, extra):
+        self.session = {"id": new_session_id(), "title": "", "cwd": str(Path.cwd()),
+                        "created": time.time(), "updated": time.time(),
+                        "conv": {"model": model, "tools": tools, "extra_system": extra,
+                                 "messages": [], "display": {}},
+                        "turns": []}
+        self.reset_system()
+        USAGE.ctx = 0
+
+    def reset_system(self):
+        c = self.conv
+        msgs = [m for m in c["messages"] if m.get("role") != "system"]
+        c["messages"] = [{"role": "system", "content": system_prompt(
+            c["tools"], c.get("extra_system"), ide=self.ide)}] + msgs
+
+    def meta(self, s=None):
+        s = s or self.session
+        c = s["conv"]
+        return {"id": s["id"], "title": s.get("title") or "", "cwd": s.get("cwd"),
+                "created": s.get("created"), "updated": s.get("updated"), "model": c["model"],
+                "tools": c["tools"], "system": c.get("extra_system") or "",
+                "messages": sum(m.get("role") == "user" for m in c["messages"])}
+
+    def save(self):
+        s = self.session
+        if not any(m.get("role") == "user" for m in self.conv["messages"]):
+            return
+        s["updated"] = time.time()
+        try:
+            write_json_atomic(session_path(s["id"]), s)
+            save_conv({k: v for k, v in self.conv.items()})     # so `tai -c` continues it
+        except Exception as e:
+            self.proto.event("notice", level="warning", text=f"could not save the session: {e}")
+        self.proto.event("session", session=self.meta())
+
+    def tools(self, sub=False):
+        if not self.conv["tools"]:
+            return None
+        base = SUB_TOOLS if sub else TOOLS
+        return base + IDE_TOOLS if self.ide else base
+
+    def state(self):
+        return {"session": self.meta(), "model": self.conv["model"], "mode": self.perms.mode,
+                "tools": self.conv["tools"], "system": self.conv.get("extra_system") or "",
+                "busy": self.busy, "usage": self.usage()}
+
+    def usage(self):
+        return {"input": USAGE.inp, "output": USAGE.out, "ctx": USAGE.ctx, "maxCtx": USAGE.max_ctx}
+
+    def emit_usage(self):
+        self.proto.event("usage", usage=self.usage())
+
+    # ------------------------------------------------------------ checkpoints
+    def _before_write(self, path, old):
+        with self.lock:
+            turn = self.cur_turn
+            if turn is not None and str(path) not in turn["files"]:
+                turn["files"][str(path)] = snapshot(path)
+
+    def _after_write(self, path, old, new):
+        _tls.last_write = (path, old, new)
+        self.proto.event("file_changed", path=str(path), created=old is None)
+
+    def rewind_files(self, msg_index):
+        """Files changed in turns at or after msg_index, oldest snapshot per file."""
+        files = {}
+        for t in reversed(self.session["turns"]):
+            if t["msg"] >= msg_index:
+                files.update(t["files"])       # earlier turns overwrite: oldest snapshot wins
+        return files
+
+    # ------------------------------------------------------------ transcript for the UI
+    def transcript(self):
+        msgs, disp = self.conv["messages"], self.conv.get("display") or {}
+        items, results = [], {}
+        for m in msgs:
+            if m.get("role") == "tool":
+                results[m.get("tool_call_id")] = m.get("content") or ""
+        for i, m in enumerate(msgs):
+            role = m.get("role")
+            if role == "user":
+                d = disp.get(str(i)) or {}
+                items.append({"type": "user", "index": i, "text": d.get("text", m.get("content") or ""),
+                              "files": d.get("files") or [], "context": d.get("context") or "",
+                              "kind": d.get("kind") or "", "time": d.get("time")})
+            elif role == "assistant":
+                if m.get("content"):
+                    items.append({"type": "assistant", "text": m["content"]})
+                for tc in m.get("tool_calls") or []:
+                    name = tc["function"]["name"]
+                    args = parse_args({"arguments": tc["function"].get("arguments")}) or {}
+                    res = results.get(tc["id"], "")
+                    if name == "task":
+                        items.append({"type": "task", "id": tc["id"],
+                                      "label": clip(args.get("description") or args.get("prompt") or "", 40),
+                                      "prompt": args.get("prompt") or "", "result": res,
+                                      "done": tc["id"] in results})
+                        continue
+                    label, shown = describe_call(name, args)
+                    bad = res.startswith(("Error", "The user denied", "Not run", "Interrupted"))
+                    done = tc["id"] in results
+                    items.append({"type": "tool", "id": tc["id"], "name": name, "label": label,
+                                  "shown": shown, "args": ui_args(args), "output": res[:6000],
+                                  "summary": clip(res.splitlines()[0] if res else "", 120) if done else "",
+                                  "error": bad, "done": done})
+        if self.busy and self.streaming_text:
+            items.append({"type": "assistant", "text": self.streaming_text, "streaming": True})
+        return items
+
+    # ------------------------------------------------------------ composing user messages
+    def compose(self, p):
+        text = str(p.get("text") or "")
+        blocks, files = [], []
+        for a in p.get("attachments") or []:
+            try:
+                path = resolve(a["path"])
+                rel = show_path(path)
+                rng = a.get("range")
+                if path.is_dir():
+                    names = sorted(x.name + ("/" if x.is_dir() else "") for x in path.iterdir()
+                                   if x.name not in SKIP_DIRS)[:500]
+                    blocks.append(f'<directory path="{rel}">\n' + "\n".join(names) + "\n</directory>")
+                    files.append(rel + "/")
+                    continue
+                if path.suffix.lower() == ".pdf":
+                    body = pdf_to_text(path.read_bytes())
+                elif is_binary(path):
+                    blocks.append(f'<file path="{rel}">(binary file, not attached)</file>')
+                    files.append(rel)
+                    continue
+                else:
+                    body = read_text(path)
+                label = rel
+                if rng:
+                    a0, b0 = int(rng[0]), int(rng[1])
+                    lines = body.splitlines()
+                    body = "\n".join(f"{n:>6}\t{l}" for n, l in
+                                     enumerate(lines[a0 - 1:b0], a0))
+                    label = f"{rel}:{a0}-{b0}" if b0 != a0 else f"{rel}:{a0}"
+                if len(body) > MAX_ATTACH:
+                    body = body[:MAX_ATTACH] + f"\n[... truncated; read_file {rel} for the rest]"
+                blocks.append(f'<file path="{label}">\n{body}\n</file>')
+                files.append(label)
+            except (ToolError, OSError, KeyError, ValueError, TypeError) as e:
+                blocks.append(f"<file path=\"{a.get('path')}\">(could not attach: {e})</file>")
+                files.append(str(a.get("path")))
+        ctx, ctx_label = p.get("context") or {}, ""
+        if ctx.get("path"):
+            try:
+                rel = show_path(resolve(ctx["path"]))
+            except (OSError, ValueError):
+                rel = ctx["path"]
+            parts = [f"The user has {rel} open in the editor."]
+            ctx_label = rel
+            sel = ctx.get("selection") or {}
+            if sel.get("text"):
+                a0, b0 = sel.get("start"), sel.get("end")
+                sel_text = sel["text"][:20000]
+                parts.append(f"Selected (lines {a0}-{b0}):\n```\n{sel_text}\n```")
+                ctx_label = f"{rel}:{a0}-{b0}" if a0 != b0 else f"{rel}:{a0}"
+            blocks.insert(0, "<ide_context>\n" + "\n".join(parts) + "\n</ide_context>")
+        content = "\n\n".join(blocks + [text]) if blocks else text
+        display = {"text": text, "files": files, "context": ctx_label, "time": time.time()}
+        return content, display
+
+    def add_user(self, content, display, client_id=None, injected=False):
+        with self.lock:
+            msgs = self.conv["messages"]
+            idx = len(msgs)
+            msgs.append({"role": "user", "content": content})
+            self.conv.setdefault("display", {})[str(idx)] = display
+            self.cur_turn = {"msg": idx, "files": {}}
+            self.session["turns"].append(self.cur_turn)
+            if not self.session.get("title"):
+                self.session["title"] = clip(display.get("text") or content, 80)
+        self.proto.event("user", index=idx, clientId=client_id, injected=injected,
+                         text=display.get("text", ""), files=display.get("files") or [],
+                         context=display.get("context") or "")
+        return idx
+
+    def drop_user(self, idx):
+        with self.lock:
+            msgs = self.conv["messages"]
+            if len(msgs) == idx + 1:
+                msgs.pop()
+                self.conv.get("display", {}).pop(str(idx), None)
+                turns = self.session["turns"]
+                if turns and turns[-1]["msg"] == idx:
+                    turns.pop()
+                if not any(m.get("role") == "user" for m in msgs):
+                    self.session["title"] = ""
+
+    # ------------------------------------------------------------ model streaming
+    def stream(self, model, msgs, tools, main=True, agent=None, on_text=None, tool_choice=None):
+        parts, streamed = [], 0
+        last = [0.0]
+        calls, usage = [], None
+        gen = pumped(model, msgs, tools, CANCEL.is_set, tool_choice)
+        try:
+            for kind, val in gen:
+                if kind == "text":
+                    parts.append(val)
+                    n = est_tokens(val)
+                    streamed += n
+                    USAGE.stream(n)
+                    if on_text:
+                        on_text(val)
+                elif kind == "tool":
+                    n = est_tokens(val[1])
+                    streamed += n
+                    USAGE.stream(n)
+                    if main and time.time() - last[0] > 0.15:
+                        last[0] = time.time()
+                        self.proto.event("tool_writing", name=val[0], tokens=streamed, agent=agent)
+                else:
+                    calls, usage = val
+        except Cancelled:
+            raise Cancelled("".join(parts)) from None
+        except Exception as e:
+            if CANCEL.is_set():
+                raise Cancelled("".join(parts))
+            if isinstance(e, RuntimeError):
+                raise
+            raise RuntimeError(f"connection lost: {e.__class__.__name__}: {e}") from None
+        finally:
+            gen.close()
+            USAGE.stream(-streamed)
+        USAGE.add(usage, main=main)
+        self.emit_usage()
+        return "".join(parts), calls, usage
+
+    # ------------------------------------------------------------ tools
+    def runners(self):
+        r = dict(RUNNERS)
+        r["get_diagnostics"] = self.tool_diagnostics
+        return r
+
+    def tool_diagnostics(self, a, perms):
+        path = a.get("path")
+        target = str(resolve(path)) if path else None
+        res = self.proto.request("ide/diagnostics", {"path": target}, timeout=15)
+        if not isinstance(res, list):
+            raise ToolError("VS Code did not return diagnostics")
+        lines = []
+        for d in res[:300]:
+            try:
+                where = show_path(Path(d["path"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            src = f" [{d['source']}]" if d.get("source") else ""
+            lines.append(f"{where}:{d.get('line')}:{d.get('col')}: {d.get('severity')}: "
+                         f"{d.get('message')}{src}")
+        if not lines:
+            return "(no problems reported)", "no problems"
+        n_err = sum(d.get("severity") == "error" for d in res)
+        return "\n".join(lines), f"{n_err} errors, {len(res) - n_err} other"
+
+    def run_tool(self, call, agent=None):
+        try:
+            return self._run_tool(call, agent)
+        except Exception as e:      # never leave a tool call without a result
+            self.proto.event("tool_end", id=call["id"], summary=f"Error: {e}", error=True,
+                             output=f"Error: {e}", diff=None, agent=agent)
+            return f"Error: {e}"
+
+    def _run_tool(self, call, agent=None):
+        args = parse_args(call)
+        label, shown = describe_call(call["name"], args)
+        self.proto.event("tool_start", id=call["id"], name=call["name"], label=label, shown=shown,
+                         args=ui_args(args), agent=agent)
+        if (self.caps.get("autosave") and args and isinstance(args.get("path"), str)
+                and call["name"] in ("read_file", "edit_file", "write_file")):
+            try:
+                self.proto.request("ide/saveFile", {"path": str(resolve(args["path"]))}, timeout=5)
+            except (OSError, ValueError, RuntimeError):
+                pass
+        _tls.last_write = None
+        try:
+            if call["name"] in ("web_search", "web_fetch"):
+                result, summary, style = self.interruptible(call)
+            else:
+                result, summary, style = exec_tool(call, self.perms, self.runners())
+        except Exception as e:      # a tool must never take the session down
+            result, summary, style = f"Error: {e}", f"Error: {e}", "red"
+        diff = None
+        lw = getattr(_tls, "last_write", None)
+        if lw and style != "red":
+            path, old, new = lw
+            if len(new) <= MAX_PREVIEW and (old is None or len(old) <= MAX_PREVIEW):
+                diff = {"path": str(path), "old": old, "new": new}
+        _tls.last_write = None
+        self.proto.event("tool_end", id=call["id"], summary=summary, error=style == "red",
+                         output=result[:6000], diff=diff, agent=agent)
+        return result
+
+    def interruptible(self, call):
+        """Runs a read-only network tool in a helper thread so that Stop doesn't wait for a slow
+        search or download; an abandoned request finishes in the background and is discarded."""
+        box, label = {}, getattr(_tls, "label", "")
+
+        def work():
+            _tls.label = label
+            try:
+                box["r"] = exec_tool(call, self.perms, self.runners())
+            except Exception as e:
+                box["r"] = (f"Error: {e}", f"Error: {e}", "red")
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        while t.is_alive():
+            t.join(0.05)
+            if CANCEL.is_set() and t.is_alive():
+                return "Interrupted by the user.", "Interrupted", "red"
+        return box["r"]
+
+    def execute(self, calls, model, agent=None):
+        results = {}
+        tasks = [c for c in calls if c["name"] == "task"]
+        for c in calls:
+            if c["name"] == "task":
+                continue
+            if CANCEL.is_set():
+                results[c["id"]] = "Not run: the user interrupted."
+                continue
+            results[c["id"]] = self.run_tool(c, agent)
+        if tasks and not CANCEL.is_set():
+            results.update(self.run_tasks(tasks, model))
+        return [results.get(c["id"], "Not run: the user interrupted.") for c in calls]
+
+    def run_tasks(self, tasks, model):
+        results, jobs = {}, []
+        for c in tasks:
+            a = parse_args(c)
+            if not a or not a.get("prompt"):
+                results[c["id"]] = "Error: the task tool needs a 'prompt'."
+                self.proto.event("task_start", id=c["id"], label="?", prompt="")
+                self.proto.event("task_end", id=c["id"], result=results[c["id"]], error=True)
+                continue
+            label = clip(a.get("description") or a["prompt"], 40)
+            self.proto.event("task_start", id=c["id"], label=label, prompt=a["prompt"],
+                             model=a.get("model") or model)
+            jobs.append((c, a, label))
+        if not jobs:
+            return results
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL_AGENTS) as pool:
+            futs = {pool.submit(self.subagent, c["id"], a, label, a.get("model") or model): c
+                    for c, a, label in jobs}
+            for fut, c in futs.items():
+                try:
+                    results[c["id"]], stats = fut.result()
+                    err_ = False
+                except Exception as e:
+                    results[c["id"]], stats, err_ = f"Sub-agent crashed: {e}", {}, True
+                self.proto.event("task_end", id=c["id"], result=results[c["id"]][:20000],
+                                 error=err_, **stats)
+        return results
+
+    def subagent(self, task_id, args, label, model):
+        _tls.label = label
+        msgs = [{"role": "system", "content": system_prompt(True, sub=True, ide=self.ide)},
+                {"role": "user", "content": args["prompt"]}]
+        uses = tokens = 0
+        text = ""
+        try:
+            for step in range(SUB_MAX_STEPS):
+                if CANCEL.is_set():
+                    return ("Sub-agent stopped: the user interrupted."
+                            + (f" Notes so far: {text}" if text else ""), {"uses": uses, "tokens": tokens})
+                try:
+                    text, calls, usage = self.stream(model, msgs, self.tools(sub=True), main=False,
+                                                     agent=task_id)
+                except Cancelled as c:
+                    text = c.partial
+                    continue
+                if usage:
+                    tokens += (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)
+                assistant = {"role": "assistant", "content": text or None}
+                if calls:
+                    for i, c in enumerate(calls):
+                        c["id"] = c["id"] or f"call_{task_id}_{step}_{i}"
+                    assistant["tool_calls"] = [{"id": c["id"], "type": "function", "function": {
+                        "name": c["name"], "arguments": c["arguments"] or "{}"}} for c in calls]
+                msgs.append(assistant)
+                if not calls:
+                    return text or "(the sub-agent returned no report)", {"uses": uses, "tokens": tokens}
+                if text:
+                    self.proto.event("task_note", id=task_id, text=clip(text, 300))
+                for c in calls:
+                    if CANCEL.is_set():
+                        result = "Not run: the user interrupted."
+                    else:
+                        result = self.run_tool(c, agent=task_id)
+                        uses += 1
+                    msgs.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+            return (f"Sub-agent stopped after {SUB_MAX_STEPS} steps. Last notes: {text}",
+                    {"uses": uses, "tokens": tokens})
+        except RuntimeError as e:
+            return f"Sub-agent failed: {e}", {"uses": uses, "tokens": tokens}
+        finally:
+            _tls.label = ""
+
+    # ------------------------------------------------------------ turns
+    def start_turn(self, content, display, client_id):
+        with self.lock:
+            if self.compacting:
+                raise RuntimeError("tai is compacting the conversation; send your message when it is done")
+            if self.busy:
+                self.inbox.append((content, display, client_id))
+                return True
+            self.busy = True
+        CANCEL.clear()
+        self.worker = threading.Thread(target=self.turn, args=(content, display, client_id), daemon=True)
+        self.worker.start()
+        return False
+
+    def drain_inbox(self):
+        with self.lock:
+            items, self.inbox = self.inbox, []
+        for content, display, cid in items:
+            self.add_user(content, display, cid, injected=True)
+        return bool(items)
+
+    def turn(self, content, display, client_id):
+        msgs = self.conv["messages"]
+        idx = self.add_user(content, display, client_id)
+        self.proto.event("turn_start", index=idx)
+        replied, reason, error = False, "done", None
+        t_in = t_out = 0
+        start = time.time()
+
+        def on_text(chunk):
+            self.streaming_text += chunk
+            self.proto.event("text", delta=chunk)
+        try:
+            step = 0
+            while True:
+                if step >= MAX_STEPS:
+                    reason = "max_steps"
+                    break
+                step += 1
+                self.streaming_text = ""
+                text, calls, usage = self.stream(self.conv["model"], msgs, self.tools(), on_text=on_text)
+                self.streaming_text = ""
+                if usage:
+                    t_in += usage.get("prompt_tokens") or 0
+                    t_out += usage.get("completion_tokens") or 0
+                assistant = {"role": "assistant", "content": text or None}
+                if calls:
+                    for i, c in enumerate(calls):
+                        c["id"] = c["id"] or f"call_{idx}_{step}_{i}"
+                    assistant["tool_calls"] = [{"id": c["id"], "type": "function", "function": {
+                        "name": c["name"], "arguments": c["arguments"] or "{}"}} for c in calls]
+                elif not text:
+                    assistant["content"] = "(no response)"
+                    self.proto.event("text", delta="(no response)")
+                with self.lock:
+                    msgs.append(assistant)
+                replied = True
+                self.proto.event("message_end")
+                if calls:
+                    results = self.execute(calls, self.conv["model"])
+                    with self.lock:
+                        for c, r in zip(calls, results):
+                            msgs.append({"role": "tool", "tool_call_id": c["id"], "content": r})
+                    if CANCEL.is_set():
+                        raise Cancelled()
+                injected = self.drain_inbox()
+                if not calls and not injected:
+                    break
+        except Cancelled as c:
+            reason = "cancelled"
+            if c.partial:
+                with self.lock:
+                    msgs.append({"role": "assistant", "content": c.partial})
+                replied = True
+        except RuntimeError as e:
+            reason, error = "error", str(e)
+        except SystemExit as e:
+            reason, error = "error", str(e.code)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            reason, error = "error", f"internal error: {e.__class__.__name__}: {e}"
+        finally_ok = False
+        try:
+            with self.lock:
+                fill_missing_results(msgs)
+            removed = None
+            if not replied:
+                removed = {"index": idx, "text": display.get("text", "")}
+                self.drop_user(idx)
+            self.streaming_text = ""
+            self.save()
+            finally_ok = True
+        except Exception as e:      # never leave the client waiting for turn_end
+            import traceback
+            traceback.print_exc()
+            removed, reason, error = None, "error", error or f"internal error: {e}"
+        chain = None
+        with self.lock:
+            if reason == "done" and self.inbox:
+                chain, self.inbox = self.inbox[0], self.inbox[1:]
+                unsent = []
+            else:
+                unsent = [d.get("text", "") for _, d, _ in self.inbox]
+                self.inbox = []
+                self.busy = False
+            self.cur_turn = None
+            # emitted under the lock, so a new turn's events can't come before it
+            self.proto.event("turn_end", reason=reason, error=error,
+                             removedUser=removed if finally_ok else None, unsent=unsent,
+                             stats={"input": t_in, "output": t_out, "seconds": round(time.time() - start, 1),
+                                    "model": self.conv["model"]}, usage=self.usage())
+        if chain:
+            CANCEL.clear()
+            self.turn(*chain)
+
+    def cancel(self):
+        CANCEL.set()
+        abort_streams()
+
+    def btw(self, bid, question):
+        flag = threading.Event()
+        self.btw_cancel[bid] = flag
+        msgs = consistent_prefix(list(self.conv["messages"])) + [{"role": "user", "content":
+            "[Side question — answer briefly from what you already know and the conversation so far. "
+            "Do not call any tools; this exchange will not be kept in the conversation.]\n\n" + question}]
+        tools = TOOLS + IDE_TOOLS if (self.conv["tools"] and self.ide) else (TOOLS if self.conv["tools"] else None)
+        error = None
+        try:
+            gen = pumped(self.conv["model"], msgs, tools, flag.is_set, "none" if tools else None)
+            try:
+                for kind, val in gen:
+                    if kind == "text":
+                        self.proto.event("btw_text", id=bid, delta=val)
+                    elif kind == "done":
+                        USAGE.add(val[1])
+            finally:
+                gen.close()
+        except Cancelled:
+            error = "interrupted"
+        except SystemExit as e:
+            error = str(e.code)
+        except Exception as e:
+            error = "interrupted" if flag.is_set() else str(e)
+        self.btw_cancel.pop(bid, None)
+        self.emit_usage()
+        self.proto.event("btw_end", id=bid, error=error)
+
+    def compact(self, instructions):
+        msgs = self.conv["messages"]
+        ask = ("Summarize our conversation so far so that the work can continue in a fresh context. "
+               "Include: the user's goals and requests, decisions made, files read or changed (paths), "
+               "important findings, the current state, and what remains to be done. Be complete but "
+               "concise; use markdown. Reply with the summary only." +
+               (f"\n\nAlso: {instructions}" if instructions else ""))
+        error, summary = None, ""
+        try:
+            summary, calls, _ = self.stream(self.conv["model"], consistent_prefix(msgs) + [
+                {"role": "user", "content": ask}], self.tools(), main=False, tool_choice="none")
+            if calls:
+                raise RuntimeError("the model tried to use tools instead of summarizing; try again")
+            if not summary.strip():
+                raise RuntimeError("the model returned an empty summary")
+            with self.lock:
+                before = sum(m.get("role") == "user" for m in msgs)
+                self.conv["messages"] = [msgs[0],
+                    {"role": "user", "content": "[Summary of the earlier conversation]\n\n" + summary},
+                    {"role": "assistant", "content": "Understood. I'll continue from this summary."}]
+                self.conv["display"] = {"1": {"text": summary, "kind": "summary", "time": time.time()}}
+                self.session["turns"] = []
+                USAGE.ctx = est_tokens(json.dumps(self.conv["messages"]))
+            self.save()
+        except Cancelled:
+            error = "cancelled"
+        except (RuntimeError, SystemExit) as e:
+            error = str(e)
+        with self.lock:
+            self.busy = self.compacting = False
+        self.proto.event("compact_end", error=error, transcript=self.transcript() if not error else None,
+                         usage=self.usage())
+
+    # ------------------------------------------------------------ dispatch
+    def handle(self, method, p):
+        h = getattr(self, "m_" + method.replace("/", "_"), None)
+        if h is None:
+            raise ValueError(f"unknown method {method}")
+        return h(clean(p or {}))
+
+    def require_idle(self):
+        if self.busy:
+            raise RuntimeError("tai is busy; stop the current task first")
+
+    def m_initialize(self, p):
+        self.caps = {"ide": bool(p.get("ide")), "autosave": bool(p.get("autosave"))}
+        if p.get("mode") in MODES:
+            self.perms.mode = p["mode"]
+        if p.get("model"):
+            self.conv["model"] = p["model"]
+        self.reset_system()
+        model_window(self.conv["model"])
+        return {"protocol": PROTOCOL_VERSION, "version": TAI_VERSION, "cwd": str(Path.cwd()),
+                "defaultModel": DEFAULT_MODEL, "modes": MODES, "modeInfo": MODE_INFO,
+                "apiKey": bool(os.environ.get("TILBURG_AI_API_KEY")), "state": self.state()}
+
+    def m_send(self, p):
+        content, display = self.compose(p)
+        if not content.strip():
+            raise ValueError("empty message")
+        queued = self.start_turn(content, display, p.get("clientId"))
+        return {"queued": queued}
+
+    def m_cancel(self, p):
+        with self.lock:
+            unsent = [d.get("text", "") for _, d, _ in self.inbox]
+            self.inbox = []
+        if self.busy:
+            self.cancel()
+        for f in list(self.btw_cancel.values()):
+            f.set()
+        return {"unsent": unsent}
+
+    def m_btw(self, p):
+        q = str(p.get("question") or "").strip()
+        if not q:
+            raise ValueError("empty question")
+        bid = str(p.get("id") or new_session_id())
+        threading.Thread(target=self.btw, args=(bid, q), daemon=True).start()
+        return {"id": bid}
+
+    def m_compact(self, p):
+        with self.lock:
+            self.require_idle()
+            if not any(m.get("role") == "user" for m in self.conv["messages"]):
+                raise RuntimeError("nothing to compact yet")
+            self.busy = self.compacting = True
+            CANCEL.clear()
+        threading.Thread(target=self.compact, args=(str(p.get("instructions") or ""),), daemon=True).start()
+        return {}
+
+    def m_models(self, p):
+        return {"models": [{"id": m["id"], "maxInput": m.get("max_input_tokens"),
+                            "embedding": m.get("mode") == "embedding"} for m in list_models()]}
+
+    def m_set(self, p):
+        if "mode" in p:
+            if p["mode"] not in MODES:
+                raise ValueError(f"unknown mode {p['mode']}")
+            self.perms.mode = p["mode"]
+        if p.get("model"):
+            self.conv["model"] = str(p["model"])
+            USAGE.max_ctx = None
+            model_window(self.conv["model"])
+        if "tools" in p or "system" in p:
+            self.require_idle()
+            if "tools" in p:
+                self.conv["tools"] = bool(p["tools"])
+            if "system" in p:
+                self.conv["extra_system"] = str(p["system"] or "") or None
+            self.reset_system()
+        if any(m.get("role") == "user" for m in self.conv["messages"]):
+            self.save()
+        st = self.state()
+        self.proto.event("state", state=st)
+        return st
+
+    def m_state(self, p):
+        return self.state()
+
+    def m_new_session(self, p):
+        self.require_idle()
+        c = self.conv
+        self.new_session(p.get("model") or c["model"], c["tools"], None)
+        self.perms.always.clear()
+        return self.state()
+
+    def m_sessions(self, p):
+        out, cwd = [], str(Path.cwd())
+        try:
+            files = sorted(SESSIONS.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+        except OSError:
+            files = []
+        for f in files[:500]:
+            try:
+                s = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not p.get("all") and s.get("cwd") != cwd:
+                continue
+            out.append(self.meta(s))
+        return {"sessions": out}
+
+    def m_load_session(self, p):
+        self.require_idle()
+        s = json.loads(session_path(p["id"]).read_text(encoding="utf-8"))
+        s["conv"].setdefault("display", {})
+        s.setdefault("turns", [])
+        self.session = s
+        self.reset_system()
+        USAGE.ctx = 0
+        self.perms.always.clear()
+        return {"state": self.state(), "transcript": self.transcript()}
+
+    def m_delete_session(self, p):
+        if p["id"] == self.session["id"]:
+            self.require_idle()
+        path = session_path(p["id"])
+        if path.exists():
+            path.unlink()
+        if p["id"] == self.session["id"]:
+            self.new_session(self.conv["model"], self.conv["tools"], None)
+        return {}
+
+    def m_rename_session(self, p):
+        title = clip(str(p.get("title") or ""), 120)
+        if p["id"] == self.session["id"]:
+            self.session["title"] = title
+            self.save()
+            return {}
+        path = session_path(p["id"])
+        s = json.loads(path.read_text(encoding="utf-8"))
+        s["title"] = title
+        write_json_atomic(path, s)
+        return {}
+
+    def m_transcript(self, p):
+        return {"transcript": self.transcript(), "state": self.state()}
+
+    def m_rewind_preview(self, p):
+        idx = int(p["index"])
+        files = self.rewind_files(idx)
+        return {"files": [{"path": k, "rel": show_path(Path(k)), "created": v is None,
+                           "restorable": not (isinstance(v, dict) and "skipped" in v)}
+                          for k, v in files.items()]}
+
+    def m_rewind(self, p):
+        self.require_idle()
+        idx = int(p["index"])
+        msgs = self.conv["messages"]
+        if not (0 < idx < len(msgs)) or msgs[idx].get("role") != "user":
+            raise ValueError("not a user message")
+        restored, failed = [], []
+        if p.get("files", True):
+            for path, snap in self.rewind_files(idx).items():
+                try:
+                    restore(Path(path), snap)
+                    restored.append(show_path(Path(path)))
+                    self.proto.event("file_changed", path=path, created=False)
+                except OSError as e:
+                    failed.append({"path": show_path(Path(path)), "error": str(e)})
+        d = (self.conv.get("display") or {}).get(str(idx)) or {}
+        text = d.get("text", msgs[idx].get("content") or "")
+        if p.get("conversation", True):
+            with self.lock:
+                del msgs[idx:]
+                self.conv["display"] = {k: v for k, v in (self.conv.get("display") or {}).items()
+                                        if int(k) < idx}
+                self.session["turns"] = [t for t in self.session["turns"] if t["msg"] < idx]
+                USAGE.ctx = 0
+        else:
+            for t in self.session["turns"]:
+                if t["msg"] >= idx:
+                    t["files"] = {}
+        self.save()
+        return {"text": text, "restored": restored, "failed": failed,
+                "transcript": self.transcript(), "state": self.state()}
+
+    def m_export(self, p):
+        md = to_markdown(self.conv)
+        if p.get("path"):
+            Path(p["path"]).expanduser().write_text(md, encoding="utf-8")
+        return {"markdown": md}
+
+    def m_usage(self, p):
+        return self.usage()
+
+    def m_ping(self, p):
+        return {"pong": True}
+
+
+def serve(args):
+    # Protocol messages own the real stdout; anything else printed goes to stderr.
+    proto_out = os.fdopen(os.dup(1), "w", encoding="utf-8", newline="\n", buffering=1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+    if RICH:
+        console.file = sys.stderr
+    proto = Proto(proto_out)
+    mode = "auto" if args.auto else "accept-edits" if args.auto_edit else "manual"
+    server = Server(proto, args.model or DEFAULT_MODEL, mode)
+    if args.chat:
+        server.conv["tools"] = False
+        server.reset_system()
+    proto.event("ready", version=TAI_VERSION, protocol=PROTOCOL_VERSION,
+                hasKey=bool(os.environ.get("TILBURG_AI_API_KEY") or stored_key()))
+
+    def work(id_, method, params):
+        try:
+            res = server.handle(method, params)
+            if id_ is not None:
+                proto.reply(id_, res)
+        except SystemExit as e:
+            if id_ is not None:
+                proto.reply(id_, error=str(e.code))
+        except Exception as e:
+            if id_ is not None:
+                proto.reply(id_, error=f"{e}" if isinstance(e, (RuntimeError, ValueError, KeyError))
+                            else f"{e.__class__.__name__}: {e}")
+    slow = {"models", "export"}
+    import io
+    stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+    for line in stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            proto.event("notice", level="error", text="tai: received invalid JSON")
+            continue
+        if not isinstance(msg, dict):
+            continue
+        method = msg.get("method")
+        if not method:
+            proto.resolve(msg)              # answer to one of our requests
+            continue
+        if method == "shutdown":
+            proto.reply(msg.get("id"), {})
+            break
+        if method in slow:
+            threading.Thread(target=work, args=(msg.get("id"), method, msg.get("params")),
+                             daemon=True).start()
+        else:
+            work(msg.get("id"), method, msg.get("params"))
+    # client gone: stop running work, save, exit
+    proto.closed.set()
+    if server.busy:
+        server.cancel()
+        if server.worker:
+            server.worker.join(timeout=5)
+    os._exit(0)
+
+
+# ================================================================ main
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="tai", description="A terminal AI agent on Tilburg.ai.",
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=HELP)
+    ap.add_argument("prompt", nargs="*", help="task or question (omit for an interactive session)")
+    ap.add_argument("-m", "--model", help=f"model id (default: {DEFAULT_MODEL})")
+    ap.add_argument("-s", "--system", help="extra instructions for the model")
+    ap.add_argument("-f", "--file", action="append", default=[], help="attach a file (repeatable)")
+    ap.add_argument("-c", "--continue", dest="cont", action="store_true",
+                    help="continue the last conversation")
+    ap.add_argument("-i", "--interactive", action="store_true",
+                    help="stay in the session after the first answer")
+    ap.add_argument("--chat", action="store_true", help="plain chat: no tools")
+    ap.add_argument("--auto-edit", action="store_true",
+                    help="start in accept-edits mode: file edits run without asking")
+    ap.add_argument("--auto", action="store_true",
+                    help="start in auto mode: edits, commands and fetches run without asking")
+    ap.add_argument("--raw", action="store_true", help="plain text output, no markdown rendering")
+    ap.add_argument("--models", action="store_true", help="list available models")
+    ap.add_argument("-r", "--resume", metavar="ID", help="resume a saved session (e.g. one from VS Code)")
+    ap.add_argument("--set-key", action="store_true", help="store your Tilburg.ai API key for tai")
+    ap.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)  # JSON protocol for the VS Code extension
+    ap.add_argument("--version", action="version", version=f"tai {TAI_VERSION}")
+    args = ap.parse_args()
+
+    if args.serve:
+        serve(args)
+        return
+
+    if args.set_key:
+        set_key()
+        return
+
+    if args.models:
+        print_models(args.model or DEFAULT_MODEL)
+        return
+
+    conv = None
+    if args.resume:
+        try:
+            conv = json.loads(session_path(args.resume).read_text(encoding="utf-8"))["conv"]
+            conv.setdefault("tools", True)
+        except (OSError, ValueError, KeyError):
+            sys.exit(f"tai: no saved session {args.resume}")
+    elif args.cont:
+        conv = load_conv()
+        if not conv:
+            dim("no previous conversation, starting a new one")
+        else:
+            conv.setdefault("tools", True)
+    use_tools = not args.chat
+    if not conv:
+        conv = new_conv(args.model or DEFAULT_MODEL, use_tools, args.system)
+    else:
+        if args.model:
+            conv["model"] = args.model
+        if args.chat:
+            conv["tools"] = False
+        if args.system:
+            conv["extra_system"] = args.system
+        reset_system(conv)
+    perms = Permissions("auto" if args.auto else "accept-edits" if args.auto_edit else "manual")
+
+    try:
+        attachments = [read_file_block(f) for f in args.file]
+    except RuntimeError as e:
+        sys.exit(f"tai: {e}")
+
+    piped = None
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read()
+        if piped.strip():
+            attachments.append(f"<stdin>\n{piped}\n</stdin>")
+        try:  # reattach the keyboard for approvals and -i
+            sys.stdin = open("CONIN$" if WINDOWS else "/dev/tty", encoding="utf-8")
+        except OSError:
+            pass
+
+    prompt = " ".join(args.prompt).strip()
+    markdown = not args.raw
+
+    if prompt or (piped and piped.strip()):
+        content = "\n\n".join(attachments + ([prompt] if prompt else []))
+        ok = ask(conv, perms, markdown, content)
+        if not args.interactive:
+            sys.exit(0 if ok else 1)
+        attachments = []
+
+    if not sys.stdin.isatty():
+        sys.exit("tai: an interactive session needs a terminal")
+    repl(conv, perms, markdown, pending=attachments)
+
+
+def cli():
+    """Entry point (also of the installed `tai` command)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:      # never crash on a character the console can't show (e.g. Windows code pages)
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    cli()

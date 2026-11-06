@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 
-from conftest import TAI, api_log, mock, reset_log, wait_until
+from conftest import SHELL, TAI, WINDOWS, api_log, mock, reset_log, wait_until
 
 
 def init(c, **p):
@@ -127,7 +127,7 @@ def test_modes(client):
     asked = []
     c.approve = lambda p: (asked.append(p["kind"]), {"decision": "yes"})[1]
     script = mock({"tools": [{"name": "write_file", "args": {"path": "n.txt", "content": "hi"}},
-                             {"name": "bash", "args": {"command": "echo run"}},
+                             {"name": SHELL, "args": {"command": "echo run"}},
                              {"name": "read_file", "args": {"path": ".env"}}]}, {"text": "ok"})
     c.send(script)
     assert asked == ["bash", "read"]
@@ -142,7 +142,8 @@ def test_modes(client):
 def test_bash_output_and_secret_env_hidden(client):
     c = client(extra_env={"MY_API_KEY": "s3cret"})
     init(c, mode="auto")
-    _, end, m = c.send(mock({"tools": [{"name": "bash", "args": {"command": "echo out; echo ${MY_API_KEY:-none}; exit 3"}}]},
+    _, end, m = c.send(mock({"tools": [{"name": SHELL, "args": {"command": ("echo out; if ($env:MY_API_KEY) { echo $env:MY_API_KEY } else { echo none }; exit 3" if WINDOWS
+                 else "echo out; echo ${MY_API_KEY:-none}; exit 3")}}]},
                             {"text": "k"}))
     te = c.wait("tool_end", start=m)
     assert "out" in te["output"] and "none" in te["output"] and "s3cret" not in te["output"]
@@ -216,7 +217,7 @@ def test_cancel_running_command(client):
     c = client()
     init(c, mode="auto")
     m = c.mark()
-    c.call("send", {"text": mock({"tools": [{"name": "bash", "args": {"command": "sleep 30"}}]}, {"text": "x"})})
+    c.call("send", {"text": mock({"tools": [{"name": SHELL, "args": {"command": "sleep 30"}}]}, {"text": "x"})})
     c.wait("tool_start", start=m)
     t = time.time()
     c.call("cancel")
@@ -230,7 +231,7 @@ def test_cancel_pending_approval(client):
     init(c)
     c.approve = lambda p: None                 # never answer
     m = c.mark()
-    c.call("send", {"text": mock({"tools": [{"name": "bash", "args": {"command": "echo hi"}}]}, {"text": "x"})})
+    c.call("send", {"text": mock({"tools": [{"name": SHELL, "args": {"command": "echo hi"}}]}, {"text": "x"})})
     req = c.wait("_request", start=m)
     c.call("cancel")
     rc = c.wait("request_cancelled", start=m)
@@ -346,7 +347,7 @@ def test_btw_during_running_turn_uses_consistent_history(client, api):
     init(c)
     c.approve = lambda p: None
     m = c.mark()
-    c.call("send", {"text": mock({"tools": [{"name": "bash", "args": {"command": "echo"}}]}, {"text": "x"})})
+    c.call("send", {"text": mock({"tools": [{"name": SHELL, "args": {"command": "echo"}}]}, {"text": "x"})})
     c.wait("_request", start=m)              # turn is waiting for approval; tool call has no result yet
     reset_log(api)
     c.call("btw", {"question": "quick", "id": "b2"})
@@ -561,7 +562,7 @@ def test_mode_change_releases_pending_approval(client):
     init(c)
     c.approve = lambda p: None
     m = c.mark()
-    c.call("send", {"text": mock({"tools": [{"name": "bash", "args": {"command": "echo released"}}]}, {"text": "x"})})
+    c.call("send", {"text": mock({"tools": [{"name": SHELL, "args": {"command": "echo released"}}]}, {"text": "x"})})
     c.wait("_request", start=m)
     c.call("set", {"mode": "auto"})
     end = c.wait("turn_end", start=m)
@@ -583,7 +584,7 @@ def test_shutdown_while_busy_exits(client):
     c = client()
     init(c, mode="auto")
     m = c.mark()
-    c.call("send", {"text": mock({"tools": [{"name": "bash", "args": {"command": "sleep 60"}}]})})
+    c.call("send", {"text": mock({"tools": [{"name": SHELL, "args": {"command": "sleep 60"}}]})})
     c.wait("tool_start", start=m)
     t = time.time()
     c.p.stdin.close()
@@ -646,7 +647,7 @@ def test_lone_surrogate_does_not_break_the_session(client):
     end = c.wait("turn_end", start=m)
     assert end["reason"] == "done", end
     assert "half an emoji" in c.text_since(m)
-    _, end, m = c.send(mock({"tools": [{"name": "bash", "args": {"command": "echo still ok"}}]}, {"text": "k"}))
+    _, end, m = c.send(mock({"tools": [{"name": SHELL, "args": {"command": "echo still ok"}}]}, {"text": "k"}))
     assert "still ok" in c.wait("tool_end", start=m)["output"]      # approvals still reach the client
     assert c.call("sessions")["sessions"]
 
@@ -714,7 +715,7 @@ def test_transcript_mid_turn_includes_streaming_text_and_running_tools(client):
     c.wait("turn_end", start=m)
     c.approve = lambda p: None
     m = c.mark()
-    c.call("send", {"text": mock({"tools": [{"name": "bash", "args": {"command": "echo"}}]})})
+    c.call("send", {"text": mock({"tools": [{"name": SHELL, "args": {"command": "echo"}}]})})
     c.wait("_request", start=m)
     t = c.call("transcript")["transcript"]
     assert t[-1]["type"] == "tool" and t[-1]["done"] is False

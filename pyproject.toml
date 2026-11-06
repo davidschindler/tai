@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tai-agent"
+dynamic = ["version"]
+description = "tai: a terminal AI agent on the Tilburg.ai API (files, shell, web search, sub-agents)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["rich>=13", "prompt_toolkit>=3.0.30"]
+authors = [{ name = "David Schindler" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+]
+
+[project.scripts]
+tai = "tai:cli"
+
+[tool.setuptools]
+py-modules = ["tai"]
+
+[tool.setuptools.dynamic]
+version = { attr = "tai.TAI_VERSION" }

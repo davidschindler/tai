@@ -12,7 +12,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mock_api  # noqa: E402
 
-TAI = os.environ.get("TAI_BIN", str(Path.home() / ".local/bin/tai"))
+TAI = os.environ.get("TAI_BIN", str(Path(__file__).resolve().parents[1] / "tai.py"))
+WINDOWS = os.name == "nt"
+SHELL = "powershell" if WINDOWS else "bash"     # name of tai's shell tool on this OS
 
 
 @pytest.fixture(scope="session")
@@ -40,7 +42,7 @@ class Client:
         env.update(extra_env or {})
         self.p = subprocess.Popen([sys.executable, TAI, "--serve", *args], cwd=self.ws, env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  text=True, bufsize=1)
+                                  text=True, encoding="utf-8", bufsize=1)
         self.events = []
         self.cond = threading.Condition()
         self.replies = {}

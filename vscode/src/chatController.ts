@@ -9,7 +9,7 @@ import type {
   ApprovalParams, Decision, HostMessage, Mode, ModelInfo, SessionMeta, Settings, TaiEvent, TaiState,
   TranscriptItem, WebviewMessage,
 } from "./protocol";
-import { findExecutable, TaiClient } from "./taiClient";
+import { findTai, TaiClient, TaiCommand } from "./taiClient";
 import { webviewHtml } from "./webviewHtml";
 
 export interface Shared {
@@ -167,17 +167,35 @@ export class ChatController implements vscode.Disposable {
     return this.starting;
   }
 
+  /** tai bundled with the extension, an installed one, or the one the settings name. */
+  private findTai(preferInstalled = false): TaiCommand | undefined {
+    return findTai({
+      setting: config().get<string>("executablePath"),
+      pythonSetting: config().get<string>("pythonPath"),
+      bundled: path.join(this.shared.ctx.extensionPath, "tai", "tai.py"),
+      preferInstalled,
+    });
+  }
+
+  private missingTai(): string {
+    if ((config().get<string>("pythonPath") ?? "").trim())
+      return "The Python named in the “tai.pythonPath” setting could not be run (tai needs Python 3.9 or newer).";
+    return (config().get<string>("executablePath") ?? "").trim()
+      ? "Could not run the program named in the “tai.executablePath” setting."
+      : "tai needs Python 3.9 or newer. Install it from python.org (on Windows, tick “Add python.exe to PATH”), " +
+        "then click Restart. If Python is installed somewhere else, set “tai.pythonPath”.";
+  }
+
   private async start(): Promise<boolean> {
     this.post({ type: "status", status: "starting" });
-    const exe = findExecutable(config().get("executablePath"));
-    if (!exe) {
-      this.post({ type: "status", status: "error", canRestart: true,
-        message: "Could not find the tai program. Install it to ~/.local/bin/tai or set “tai.executablePath”." });
+    const tai = this.findTai();
+    if (!tai) {
+      this.post({ type: "status", status: "error", canRestart: true, message: this.missingTai() });
       return false;
     }
+    this.shared.log(`starting ${tai.python ? tai.python + " " : ""}${tai.executable} (${tai.source})`);
     const { env, hasKey } = await this.env();
-    const python = (config().get<string>("pythonPath") ?? "").trim() || undefined;
-    const client = new TaiClient({ executable: exe, python, cwd: this.cwd, env, log: this.shared.log });
+    const client = new TaiClient({ executable: tai.executable, python: tai.python, cwd: this.cwd, env, log: this.shared.log });
     this.client = client;
     client.onEvent((e) => this.onEvent(client, e));
     client.onRequest((m, p, id) => this.onServerRequest(m, p, id));
@@ -195,7 +213,6 @@ export class ChatController implements vscode.Disposable {
       }
     });
     try {
-      this.shared.log(`starting ${python ? python + " " : ""}${exe} --serve in ${this.cwd}`);
       const ready = await client.start();
       this.version = ready.version;
       const mode = this.state?.mode ?? config().get<Mode>("initialPermissionMode", "manual");
@@ -216,7 +233,7 @@ export class ChatController implements vscode.Disposable {
         }
         this.sessionToLoad = undefined;
       }
-      this.post({ type: "status", status: "ready", needsKey: !hasKey });
+      this.post({ type: "status", status: "ready", needsKey: !hasKey && !ready.hasKey });
       this.sendInit(items);
       return true;
     } catch (e: any) {
@@ -707,9 +724,9 @@ export class ChatController implements vscode.Disposable {
   }
 
   async openTerminal(): Promise<void> {
-    const exe = findExecutable(config().get("executablePath"));
-    if (!exe) {
-      vscode.window.showErrorMessage("Could not find the tai program.");
+    const tai = this.findTai(true);
+    if (!tai) {
+      vscode.window.showErrorMessage(this.missingTai());
       return;
     }
     const { env } = await this.env();
@@ -717,12 +734,15 @@ export class ChatController implements vscode.Disposable {
     for (const k of [KEY_VAR, ...Object.keys(config().get("environmentVariables", {}) ?? {})]) {
       if (env[k]) keep[k] = env[k]!;
     }
-    const term = vscode.window.createTerminal({ name: "tai", cwd: this.cwd, env: keep });
-    term.show();
-    const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
     const id = this.state?.session.messages ? this.state.session.id : undefined;
-    const py = (config().get<string>("pythonPath") ?? "").trim();
-    term.sendText(`${py ? q(py) + " " : ""}${q(exe)}${id ? ` -r ${id}` : ""}`);
+    const args = id ? ["-r", id] : [];
+    // run tai directly as the terminal's process: no shell quoting, same on every OS
+    const term = vscode.window.createTerminal({
+      name: "tai", cwd: this.cwd, env: keep,
+      shellPath: tai.python ?? tai.executable,
+      shellArgs: tai.python ? [tai.executable, ...args] : args,
+    });
+    term.show();
   }
 
   private async openFile(p: string, line?: number) {

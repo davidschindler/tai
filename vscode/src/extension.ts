@@ -242,7 +242,7 @@ export function activate(ctx: vscode.ExtensionContext) {
       },
     }),
   );
-  e.shared.log(`tai extension activated (${config().get("executablePath") || "tai from PATH"})`);
+  e.shared.log(`tai extension activated (${process.platform}; tai: ${config().get("executablePath") || "bundled, or installed"})`);
   // Show the chat once after installation, so it can be found even when the side bar is closed.
   if (!ctx.globalState.get("tai.shownOnce") && ctx.extensionMode !== vscode.ExtensionMode.Test) {
     void ctx.globalState.update("tai.shownOnce", true);

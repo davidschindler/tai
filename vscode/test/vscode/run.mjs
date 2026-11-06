@@ -4,11 +4,14 @@ import { spawn } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { fileURLToPath } from "url";
 import { runTests } from "@vscode/test-electron";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const PYTHON = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
+const LINUX = process.platform === "linux";
 
-const mock = spawn("python3", [path.join(ROOT, "test/mock_api.py")], { stdio: ["ignore", "pipe", "inherit"] });
+const mock = spawn(PYTHON, [path.join(ROOT, "..", "tests", "mock_api.py")], { stdio: ["ignore", "pipe", "inherit"] });
 const port = await new Promise((resolve) => mock.stdout.once("data", (d) => resolve(/PORT (\d+)/.exec(String(d))[1])));
 const ws = fs.mkdtempSync(path.join(os.tmpdir(), "tai-vscode-ws-"));
 const userData = fs.mkdtempSync(path.join(os.tmpdir(), "tai-vscode-user-"));
@@ -23,6 +26,10 @@ fs.writeFileSync(path.join(ws, ".vscode", "settings.json"), JSON.stringify({
     : { TILBURG_AI_API_KEY: "test-key", TAI_API_BASE: apiBase, XDG_STATE_HOME: state },
 }));
 if (!real) delete process.env.TILBURG_AI_API_KEY;
+// Test the copy of tai built into the extension, as colleagues get it: hide any installed `tai`.
+const hasTai = (d) => ["tai", "tai.exe"].some((n) => { try { return fs.statSync(path.join(d, n)).isFile(); } catch { return false; } });
+const pathKey = Object.keys(process.env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+process.env[pathKey] = (process.env[pathKey] ?? "").split(path.delimiter).filter((d) => d && !hasTai(d)).join(path.delimiter);
 // Keep the test window off the user's desktop: X11 only, on the display we were given.
 if (process.env.TAI_TEST_DISPLAY) process.env.DISPLAY = process.env.TAI_TEST_DISPLAY;
 delete process.env.WAYLAND_DISPLAY;
@@ -35,10 +42,10 @@ try {
     extensionDevelopmentPath: ROOT,
     extensionTestsPath: path.join(ROOT, "dist/test/index.js"),
     launchArgs: [ws, "--disable-extensions", "--user-data-dir", userData, "--skip-welcome", "--skip-release-notes",
-      "--disable-workspace-trust", "--disable-gpu", "--ozone-platform=x11"],
+      "--disable-workspace-trust", "--disable-gpu", ...(LINUX ? ["--ozone-platform=x11"] : [])],
     extensionTestsEnv: {
-      ...(real ? { TAI_REAL: "1" } : { TAI_API_BASE: apiBase }), XDG_STATE_HOME: state,
-      DISPLAY: process.env.TAI_TEST_DISPLAY || process.env.DISPLAY, ELECTRON_ENABLE_LOGGING: "",
+      ...(real ? { TAI_REAL: "1" } : { TAI_API_BASE: apiBase }), XDG_STATE_HOME: state, TAI_TEST_WS: ws,
+      ...(LINUX ? { DISPLAY: process.env.TAI_TEST_DISPLAY || process.env.DISPLAY } : {}), ELECTRON_ENABLE_LOGGING: "",
     },
   });
 } catch (e) {

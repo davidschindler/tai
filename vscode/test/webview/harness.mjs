@@ -6,12 +6,15 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { createRequire } from "module";
+import { fileURLToPath } from "url";
 import puppeteer from "puppeteer-core";
 
 const require = createRequire(import.meta.url);
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const { TaiClient } = require(path.join(ROOT, "dist/test/taiClient.js"));
-export const TAI = process.env.TAI_BIN || path.join(os.homedir(), ".local/bin/tai");
+export const PYTHON = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
+export const TAI = process.env.TAI_BIN || path.join(ROOT, "..", "tai.py");
+export const MOCK_API = path.join(ROOT, "..", "tests", "mock_api.py");
 
 export const THEMES = {
   dark: {
@@ -46,7 +49,7 @@ export const THEMES = {
 };
 
 export async function startMock() {
-  const p = spawn("python3", [path.join(ROOT, "test/mock_api.py")], { stdio: ["ignore", "pipe", "inherit"] });
+  const p = spawn(PYTHON, [MOCK_API], { stdio: ["ignore", "pipe", "inherit"] });
   const port = await new Promise((resolve, reject) => {
     p.stdout.once("data", (d) => {
       const m = /PORT (\d+)/.exec(String(d));
@@ -97,7 +100,7 @@ export class Harness {
   /** Starts tai --serve with the real TaiClient and forwards like ChatController. */
   async startTai({ mode = "manual" } = {}) {
     const env = { ...process.env, TAI_API_BASE: this.api, TILBURG_AI_API_KEY: "test-key", XDG_STATE_HOME: this.state };
-    const c = (this.client = new TaiClient({ executable: TAI, cwd: this.ws, env, log: () => {} }));
+    const c = (this.client = new TaiClient({ executable: TAI, python: TAI.endsWith(".py") ? PYTHON : undefined, cwd: this.ws, env, log: () => {} }));
     c.onEvent((e) => this.post({ type: "event", event: e }));
     c.onRequest((method, params, id) => {
       if (method === "approval") {
@@ -237,7 +240,18 @@ export class Harness {
   }
 }
 
+function findChrome() {
+  const c = [process.env.CHROME,
+    "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"].filter(Boolean);
+  const hit = c.find((p) => fs.existsSync(p));
+  if (!hit) throw new Error("Chrome not found; set CHROME to its path");
+  return hit;
+}
+
 export async function launch() {
-  return puppeteer.launch({ executablePath: process.env.CHROME || "/usr/bin/google-chrome", headless: true,
+  return puppeteer.launch({ executablePath: findChrome(), headless: true,
     args: ["--no-sandbox", "--disable-gpu", "--font-render-hinting=none"] });
 }

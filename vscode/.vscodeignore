@@ -2,6 +2,7 @@
 !dist/extension.js
 !dist/webview.js
 !media/**
+!tai/tai.py
 !package.json
 !README.md
 !CHANGELOG.md
