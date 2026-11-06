@@ -101,6 +101,17 @@ describe("tai extension", function () {
     }
   });
 
+  it("the tai button opens the chat even when the right side bar is closed", async () => {
+    await vscode.commands.executeCommand("workbench.action.closeAuxiliaryBar");
+    await until(() => !ext.sidebarView?.visible, 5000, "side bar closed");
+    await vscode.commands.executeCommand("tai.open");
+    await until(() => ext.sidebarView?.visible, 5000, "side bar open again");
+    const pj = require(path.join(__dirname, "..", "..", "package.json"));
+    const btn = pj.contributes.menus["editor/title"].find((m: any) => m.command === "tai.open");
+    assert.ok(btn, "editor title button");
+    assert.strictEqual(pj.contributes.configuration.properties["tai.showEditorTitleButton"].default, true);
+  });
+
   it("the real webview loads and talks to the controller", async () => {
     // the webview posts 'cancel' when told to stop: a full round trip through the webview script
     const seen: string[] = [];

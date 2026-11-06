@@ -172,6 +172,7 @@ class Extension implements vscode.Disposable {
     reg("tai.focus", async () => (await this.active()).focusInput());
     reg("tai.blur", () => vscode.commands.executeCommand("workbench.action.focusActiveEditorGroup"));
     reg("tai.openSidebar", async () => (await this.showSidebar()).focusInput());
+    reg("tai.open", async () => (await this.showSidebar()).focusInput());
     reg("tai.openInNewTab", () => this.openPanel());
     reg("tai.newConversation", async () => {
       const c = await this.active();
@@ -242,6 +243,11 @@ export function activate(ctx: vscode.ExtensionContext) {
     }),
   );
   e.shared.log(`tai extension activated (${config().get("executablePath") || "tai from PATH"})`);
+  // Show the chat once after installation, so it can be found even when the side bar is closed.
+  if (!ctx.globalState.get("tai.shownOnce") && ctx.extensionMode !== vscode.ExtensionMode.Test) {
+    void ctx.globalState.update("tai.shownOnce", true);
+    void vscode.commands.executeCommand("tai.openSidebar");
+  }
   // for the integration tests
   return { ext: e };
 }

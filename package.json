@@ -2,7 +2,7 @@
   "name": "tai-vscode",
   "displayName": "tai — Tilburg.ai agent",
   "description": "Chat with tai, your Tilburg.ai coding and research agent, right inside VS Code: edits with diffs, approvals, sub-agents, web search, sessions and checkpoints.",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "publisher": "davidschindler",
   "license": "UNLICENSED",
   "private": true,
@@ -48,6 +48,7 @@
       ]
     },
     "commands": [
+      { "command": "tai.open", "title": "Open tai", "category": "tai", "icon": { "light": "media/tai-tab-light.png", "dark": "media/tai-tab-dark.png" } },
       { "command": "tai.focus", "title": "Focus Chat Input", "category": "tai" },
       { "command": "tai.blur", "title": "Return to Editor", "category": "tai" },
       { "command": "tai.openSidebar", "title": "Open in Side Bar", "category": "tai", "icon": "$(layout-sidebar-left)" },
@@ -80,7 +81,7 @@
       "editor/title": [
         { "command": "tai.acceptDiff", "when": "resourceScheme == tai-proposed", "group": "navigation@1" },
         { "command": "tai.rejectDiff", "when": "resourceScheme == tai-proposed", "group": "navigation@2" },
-        { "command": "tai.openInNewTab", "when": "config.tai.showEditorTitleButton && !(resourceScheme == tai-proposed)", "group": "navigation@100" }
+        { "command": "tai.open", "when": "config.tai.showEditorTitleButton && !(resourceScheme == tai-proposed)", "group": "navigation@100" }
       ],
       "editor/context": [
         { "command": "tai.insertAtMention", "when": "editorTextFocus", "group": "tai@1" }
@@ -165,8 +166,8 @@
         },
         "tai.showEditorTitleButton": {
           "type": "boolean",
-          "default": false,
-          "description": "Show a button in the editor title bar that opens tai in a new tab."
+          "default": true,
+          "description": "Show the tai button (Tilburg University emblem) in the editor title bar."
         }
       }
     }
