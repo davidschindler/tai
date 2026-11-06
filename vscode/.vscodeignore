@@ -3,6 +3,7 @@
 !dist/webview.js
 !media/**
 !tai/tai.py
+!LICENSE
 !package.json
 !README.md
 !CHANGELOG.md

@@ -6,5 +6,6 @@ build/
 .vscode-test/
 vscode/test/webview/screenshots/
 vscode/tai/
+vscode/LICENSE
 __pycache__/
 .pytest_cache/

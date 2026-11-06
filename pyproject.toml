@@ -8,11 +8,13 @@ dynamic = ["version"]
 description = "tai: a terminal AI agent on the Tilburg.ai API (files, shell, web search, sub-agents)"
 readme = "README.md"
 requires-python = ">=3.9"
+license = { text = "MIT" }
 dependencies = ["rich>=13", "prompt_toolkit>=3.0.30"]
 authors = [{ name = "David Schindler" }]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
+    "License :: OSI Approved :: MIT License",
     "Environment :: Console",
 ]
 

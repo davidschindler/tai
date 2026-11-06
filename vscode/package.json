@@ -4,7 +4,7 @@
   "description": "Chat with tai, your Tilburg.ai coding and research agent, right inside VS Code: edits with diffs, approvals, sub-agents, web search, sessions and checkpoints.",
   "version": "1.1.1",
   "publisher": "davidschindler",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/davidschindler/tai"
@@ -366,7 +366,7 @@
     "test:webview": "node test/webview/run.mjs",
     "test:vscode": "node test/vscode/run.mjs",
     "test": "npm run typecheck && npm run build && npm run test:python && npm run test:webview && npm run test:vscode",
-    "package": "node esbuild.mjs --minify && vsce package --no-dependencies --skip-license"
+    "package": "node esbuild.mjs --minify && vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/diff": "^5.2.3",

@@ -4,6 +4,7 @@ import fs from "fs";
 // tai itself ships inside the extension (tai/tai.py), so it works with just Python installed.
 fs.mkdirSync("tai", { recursive: true });
 fs.copyFileSync("../tai.py", "tai/tai.py");
+fs.copyFileSync("../LICENSE", "LICENSE");      // shipped in the .vsix
 
 const watch = process.argv.includes("--watch");
 const builds = [
