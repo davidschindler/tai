@@ -21,6 +21,7 @@ Models: $TAI_MODEL (default below), $TAI_SEARCH_MODEL for web searches.
 """
 import argparse
 import concurrent.futures
+import contextlib
 import datetime
 import difflib
 import fnmatch
@@ -119,6 +120,76 @@ STREAMS_LOCK = threading.Lock()
 IO = threading.RLock()          # serializes terminal output and approval prompts
 CANCEL = threading.Event()      # set by Ctrl+C; sub-agents stop at the next step
 _tls = threading.local()        # per-thread output prefix (for sub-agents)
+INBOX = []                      # messages typed while tai works; read at its next step
+INBOX_LOCK = threading.Lock()
+APPROVAL = threading.Lock()     # one approval question at a time (parallel sub-agents)
+
+
+class LiveInput:
+    """Terminal sessions where the prompt stays open while tai works: a turn runs in a
+    background thread, its output is printed above the prompt (prompt_toolkit's
+    patch_stdout), the activity line sits above the input, and questions from the turn
+    (approvals) are answered in the prompt itself."""
+
+    def __init__(self):
+        self.active = False     # a prompt_toolkit prompt owns the bottom of the screen
+        self.busy = False       # a turn is running in the background
+        self.status = None      # object with .line() -> [(style, text)], shown above the input
+        self.question = None    # (prompt text, Event, answer box) from the turn thread
+        self.refill = ""        # queued messages to put back into the next prompt
+        self.lock = threading.Lock()
+        self.invalidate = lambda: None
+
+    def ask(self, prompt):
+        """Called from a worker thread: show prompt as the input line, wait for the answer.
+        Raises EOFError when tai is stopped meanwhile."""
+        ev, box = threading.Event(), []
+        with self.lock:
+            self.question = (prompt, ev, box)
+        self.invalidate()
+        try:
+            while not ev.wait(0.1):
+                if CANCEL.is_set():
+                    raise EOFError
+            return box[0]
+        finally:
+            with self.lock:
+                if self.question and self.question[1] is ev:
+                    self.question = None
+            self.invalidate()
+
+    def answer(self, text):
+        """Main thread: deliver the line the user entered. False if nothing was asked."""
+        with self.lock:
+            q, self.question = self.question, None
+        if not q:
+            return False
+        q[2].append(text)
+        q[1].set()
+        return True
+
+
+LIVE = LiveInput()
+
+
+class Activity:
+    """Status line for a slow step (running a command, …) while the prompt stays open."""
+    FRAMES = "·✢✳✶✻✽✻✶✳✢"
+
+    def __init__(self, text):
+        self.text, self.start = text, time.time()
+
+    def line(self):
+        t = time.time() - self.start
+        return [("class:spin", self.FRAMES[int(t * 8) % len(self.FRAMES)] + " " + self.text + " "),
+                ("class:hint", f"({int(t)}s · ctrl+c to interrupt)")]
+
+
+def ask_line(prompt):
+    """Read one answer line: in the open prompt when a turn runs in the background, else input()."""
+    if LIVE.active and threading.current_thread() is not threading.main_thread():
+        return LIVE.ask(prompt)
+    return input(prompt)
 
 
 class Usage:
@@ -192,13 +263,21 @@ class working:
         self.text, self.status = text, None
 
     def __enter__(self):
-        if RICH and sys.stdout.isatty() and threading.current_thread() is threading.main_thread():
+        self.prev = None
+        if LIVE.active:
+            if getattr(_tls, "label", ""):     # sub-agents: keep the main status line
+                return self
+            self.prev, self.live = LIVE.status, True
+            LIVE.status = Activity(self.text)
+        elif RICH and sys.stdout.isatty() and threading.current_thread() is threading.main_thread():
             self.status = console.status(Text(self.text, style=GREY), spinner="dots",
                                          spinner_style=GOLD)
             self.status.__enter__()
         return self
 
     def __exit__(self, *exc):
+        if getattr(self, "live", False):
+            LIVE.status = self.prev
         if self.status:
             self.status.__exit__(*exc)
 
@@ -214,7 +293,8 @@ class Thinking:
         self.out = 0            # estimated output tokens of this reply
         self.tool = ""          # name of a tool call being written
 
-    def status(self):
+    def parts(self):
+        """(spinner frame + verb, details) of the status line."""
         t = time.time() - self.start
         verb = f"Writing {self.tool} call… " if self.tool else "Responding… " if self.out else "Thinking… "
         bits = [f"{int(t)}s"]
@@ -225,13 +305,21 @@ class Thinking:
         if USAGE.ctx_text():
             bits.append(USAGE.ctx_text())
         bits.append("ctrl+c to interrupt")
-        return Text.assemble((self.FRAMES[int(t * 8) % len(self.FRAMES)] + " ", GOLD),
-                             (verb, f"bold {GOLD}"), (f"({' · '.join(bits)})", GREY))
+        return self.FRAMES[int(t * 8) % len(self.FRAMES)] + " " + verb, f"({' · '.join(bits)})"
+
+    def status(self):
+        head, tail = self.parts()
+        return Text.assemble((head[:2], GOLD), (head[2:], f"bold {GOLD}"), (tail, GREY))
 
     def __rich__(self):
         if self.body is None:
             return self.status()
         return Group(self.body, Text(""), self.status())
+
+    def line(self):
+        """The status as prompt_toolkit text (live prompt mode)."""
+        head, tail = self.parts()
+        return [("class:spin", head), ("class:hint", tail)]
 
 
 def with_gutter(renderable, mark="●", style="bold"):
@@ -493,52 +581,63 @@ class Permissions:
 
     def check(self, kind, question, title="Permission", body=None, detail=None):
         """kind: 'edit', 'bash', 'read' or 'fetch:<host>'. Raises Denied unless approved.
-        Holds IO so the prompt isn't interleaved with sub-agent output."""
+        Holds IO so the prompt isn't interleaved with sub-agent output (in the live prompt
+        the question is the input line itself, so only the panel is printed under IO)."""
+        if LIVE.active and threading.current_thread() is not threading.main_thread():
+            with APPROVAL:
+                return self._check(kind, question, title, body, live=True)
         with IO:
-            if CANCEL.is_set():
-                raise Denied("Cancelled.")
-            if kind in self.always:
-                return
-            if self.auto_ok(kind):
-                if kind == "edit" and body is not None:
-                    say(body)               # still show what changed
-                return
-            label = getattr(_tls, "label", "")
-            always = "for this site" if kind.startswith("fetch:") else {
-                "edit": "for file edits", "bash": "for commands", "read": "for sensitive files"}.get(kind, "")
-            if RICH:
-                items = []
-                if body is not None:
-                    items += [body, Text("")]
-                items += [Text(question, style="bold"),
-                          Text.assemble(("  1. ", GOLD), "Yes"),
-                          Text.assemble(("  2. ", GOLD), f"Yes, and don't ask again {always} this session"),
-                          Text.assemble(("  3. ", GOLD), "No, and tell tai what to do differently")]
-                ttl = Text.assemble((f" {label} › " if label else " ", GREY), (title + " ", f"bold {GOLD}"))
+            return self._check(kind, question, title, body, live=False)
+
+    def _check(self, kind, question, title, body, live):
+        if CANCEL.is_set():
+            raise Denied("Cancelled.")
+        if kind in self.always:
+            return
+        if self.auto_ok(kind):
+            if kind == "edit" and body is not None:
+                say(body)               # still show what changed
+            return
+        label = getattr(_tls, "label", "")
+        always = "for this site" if kind.startswith("fetch:") else {
+            "edit": "for file edits", "bash": "for commands", "read": "for sensitive files"}.get(kind, "")
+        if RICH:
+            items = []
+            if body is not None:
+                items += [body, Text("")]
+            items += [Text(question, style="bold"),
+                      Text.assemble(("  1. ", GOLD), "Yes"),
+                      Text.assemble(("  2. ", GOLD), f"Yes, and don't ask again {always} this session"),
+                      Text.assemble(("  3. ", GOLD), "No, and tell tai what to do differently")]
+            ttl = Text.assemble((f" {label} › " if label else " ", GREY), (title + " ", f"bold {GOLD}"))
+            with IO:
                 console.print(Panel(Group(*items), title=ttl, title_align="left", box=box.ROUNDED,
                                     border_style=GOLD, padding=(0, 1)))
-            else:
+        else:
+            with IO:
                 if body is not None:
                     print(body)
                 print(f"{question}  1 = yes, 2 = always {always}, 3 = no")
-            while True:
-                try:
-                    ans = input("  ❯ ").strip().lower()
-                except EOFError:
-                    raise Denied("No terminal available to approve this action.")
-                if ans in ("1", "y", "yes", "2", "a", "always", "3", "n", "no"):
-                    break
-                say("  type 1, 2 or 3", GREY)
-            if ans in ("2", "a", "always"):
-                self.always.add(kind)
-                return
-            if ans in ("1", "y", "yes"):
-                return
+        prompt = f"  {question} 1 yes · 2 always · 3 no ❯ " if live else "  ❯ "
+        while True:
             try:
-                why = input("  What should tai do instead? (Enter to skip) ❯ ").strip()
+                ans = ask_line(prompt).strip().lower()
             except EOFError:
-                why = ""
-            raise Denied(why)
+                raise Denied("Cancelled." if CANCEL.is_set() else
+                             "No terminal available to approve this action.")
+            if ans in ("1", "y", "yes", "2", "a", "always", "3", "n", "no"):
+                break
+            say("  type 1, 2 or 3", GREY)
+        if ans in ("2", "a", "always"):
+            self.always.add(kind)
+            return
+        if ans in ("1", "y", "yes"):
+            return
+        try:
+            why = ask_line("  What should tai do instead? (Enter to skip) ❯ ").strip()
+        except EOFError:
+            why = ""
+        raise Denied(why)
 
 
 # ================================================================ file tools
@@ -1309,11 +1408,28 @@ def system_prompt(use_tools, extra=None, sub=False, ide=False):
     return "\n\n".join(parts)
 
 
-def stream_and_render(model, messages, tools, markdown, main=True):
+def ready_blocks(buf):
+    """Split streamed markdown into (complete blocks, rest): cut after a blank line that is
+    not inside a ``` code block, so each printed piece renders correctly on its own."""
+    cut, fence, pos = 0, False, 0
+    for line in buf.splitlines(keepends=True):
+        pos += len(line)
+        if not line.endswith("\n"):
+            break
+        if line.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        elif not fence and not line.strip():
+            cut = pos
+    return buf[:cut], buf[cut:]
+
+
+def stream_and_render(model, messages, tools, markdown, main=True, tool_choice=None, mark="●"):
     """Stream one model reply. Returns (text, tool_calls, usage). KeyboardInterrupt propagates
     with the partial text attached as .partial."""
+    if LIVE.active:
+        return _stream_live(model, messages, tools, markdown, main, tool_choice, mark)
     parts = []
-    events = stream_reply(model, messages, tools)
+    events = stream_reply(model, messages, tools, tool_choice)
     calls, usage = [], None
     view = Thinking() if RICH else None
     streamed = 0
@@ -1363,6 +1479,77 @@ def stream_and_render(model, messages, tools, markdown, main=True):
     return "".join(parts), calls, usage
 
 
+def _stream_live(model, messages, tools, markdown, main, tool_choice, mark):
+    """Live-prompt variant: finished paragraphs are printed above the prompt as they arrive;
+    the 'Thinking…' line is shown above the input. Ctrl+C (CANCEL) cuts the stream."""
+    parts, pending = [], ""
+    calls, usage, streamed, first = [], None, 0, True
+    view = Thinking()
+    if main:
+        prev, LIVE.status = LIVE.status, view
+
+    def emit(chunk):
+        nonlocal first
+        chunk = chunk.strip("\n")
+        if not chunk.strip():
+            return
+        body = Markdown(chunk) if (markdown and RICH) else (Text(chunk) if RICH else chunk)
+        say(with_gutter(body, mark=mark if first else " ") if RICH else (mark + " " if first else "  ") + chunk)
+        first = False
+
+    events = stream_reply(model, messages, tools, tool_choice)
+    try:
+        try:
+            for kind, val in events:
+                if CANCEL.is_set():
+                    raise KeyboardInterrupt
+                if kind == "text":
+                    parts.append(val)
+                    n = est_tokens(val)
+                    streamed += n
+                    USAGE.stream(n)
+                    view.out += n
+                    view.tool = ""
+                    pending += val
+                    done, pending = ready_blocks(pending)
+                    if done:
+                        emit(done)
+                elif kind == "tool":
+                    view.tool = val[0]
+                    n = est_tokens(val[1])
+                    streamed += n
+                    USAGE.stream(n)
+                    view.out += n
+                else:
+                    calls, usage = val
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            if CANCEL.is_set():         # the socket was shut down by Ctrl+C
+                raise KeyboardInterrupt
+            raise
+        emit(pending)
+    except KeyboardInterrupt as e:
+        emit(pending)
+        e.partial = "".join(parts)
+        raise
+    finally:
+        events.close()
+        USAGE.stream(-streamed)
+        if main:
+            LIVE.status = prev
+        LIVE.invalidate()
+    USAGE.add(usage, main=main)
+    return "".join(parts), calls, usage
+
+
+def take_inbox():
+    with INBOX_LOCK:
+        items = INBOX[:]
+        INBOX.clear()
+    return items
+
+
 def run_turn(conv, perms, markdown, use_tools):
     """Run model ↔ tools until the model answers without tool calls."""
     msgs = conv["messages"]
@@ -1401,6 +1588,10 @@ def run_turn(conv, perms, markdown, use_tools):
             msgs.append({"role": "tool", "tool_call_id": c["id"], "content": r})
         if CANCEL.is_set():
             return
+        queued = take_inbox()
+        if queued:
+            msgs.append({"role": "user", "content": "\n\n".join(queued)})
+            dim(f"  ↳ tai is reading your {'message' if len(queued) == 1 else f'{len(queued)} messages'}")
         print()
     else:
         err(f"[stopped after {MAX_STEPS} steps — say 'continue' to keep going]")
@@ -1465,8 +1656,11 @@ HELP = """Commands:
   /help           this help                   /exit     quit (or Ctrl+C twice, or Ctrl+D)
 Alt+Enter inserts a new line (pasting multi-line text also works).
 Shift+Tab cycles the permission mode (manual → accept-edits → auto).
-Ctrl+C stops the current reply, command or sub-agents; at an empty prompt, twice quits.
-Approvals: y = once, a = always this session (for web_fetch: always for that site)."""
+While tai works the prompt stays open: /btw QUESTION is answered right away, and a
+message you type is read at tai's next step.
+Ctrl+C clears what you typed, then stops tai (queued messages come back); at an empty
+prompt with tai idle, twice quits.
+Approvals: 1 = yes, 2 = always this session (for web_fetch: that site), 3 = no."""
 
 
 def read_input(prompt):
@@ -1510,15 +1704,18 @@ def ask(conv, perms, markdown, content):
 
 
 def btw(conv, markdown, question):
-    """Answer a side question with the conversation as context, without changing it."""
-    CANCEL.clear()
-    msgs = conv["messages"] + [{"role": "user", "content":
+    """Answer a side question with the conversation as context, without changing it.
+    Works while a turn runs: it sees the conversation up to the last complete step."""
+    if not LIVE.busy:
+        CANCEL.clear()
+    msgs = consistent_prefix(list(conv["messages"])) + [{"role": "user", "content":
         "[Side question — answer briefly from what you already know and the conversation so far. "
         "Do not call any tools; this exchange will not be kept in the conversation.]\n\n" + question}]
     tools = TOOLS if conv["tools"] else None   # keep the tool schema so earlier tool calls stay valid
     print()
     try:
-        text, _, _ = stream_and_render(conv["model"], msgs, tools, markdown, main=False)
+        text, _, _ = stream_and_render(conv["model"], msgs, tools and TOOLS, markdown, main=False,
+                                       tool_choice="none" if tools else None, mark="◆")
     except KeyboardInterrupt:
         err("\n[interrupted]")
         return
@@ -1569,6 +1766,10 @@ def make_reader(conv, perms):
         if buf.text:
             buf.reset()
             state["ctrl_c"] = 0.0
+        elif LIVE.busy:
+            queued = stop_turn()
+            if queued:      # give unsent messages back, like the VS Code extension
+                buf.insert_text("\n\n".join(queued))
         elif time.time() - state["ctrl_c"] < 2:
             event.app.exit(exception=EOFError())
         else:
@@ -1588,7 +1789,21 @@ def make_reader(conv, perms):
         return shutil.get_terminal_size((80, 24)).columns
 
     def message():
-        return FormattedText([("class:rule", "─" * cols() + "\n"), ("class:prompt", "❯ ")])
+        out = []
+        # the status line is live information: leave it out of the copy of the prompt that
+        # stays in the scrollback after Enter
+        if LIVE.busy and not session.app.is_done:
+            st = LIVE.status
+            out += (st.line() if st else [("class:hint", "  working… (ctrl+c to interrupt)")]) + [("", "\n")]
+        out.append(("class:rule", "─" * cols() + "\n"))
+        q = LIVE.question
+        out.append(("class:warn", q[0]) if q else ("class:prompt", "❯ "))
+        return FormattedText(out)
+
+    def placeholder():
+        if LIVE.busy and not LIVE.question:
+            return FormattedText([("class:hint", "/btw to ask on the side · a message is read at tai's next step")])
+        return ""
 
     def toolbar():
         rule = ("class:rule", "─" * cols() + "\n")
@@ -1615,6 +1830,7 @@ def make_reader(conv, perms):
     style = Style.from_dict({
         "rule": "#5a5a5a", "prompt": f"{GOLD} bold", "model": GOLD, "hint": "#8a8a8a",
         "warn": "#e0a040 bold", "modeedit": f"{BLUE} bold", "modeauto": "#d0605a bold",
+        "spin": f"{GOLD} bold",
         "bottom-toolbar": "noreverse bg:default",
         "completion-menu.completion": "bg:#2b2b2b #d0d0d0",
         "completion-menu.completion.current": f"bg:{GOLD} #000000",
@@ -1622,11 +1838,21 @@ def make_reader(conv, perms):
         "completion-menu.meta.completion.current": f"bg:{GOLD} #000000"})
     session = PromptSession(history=FileHistory(str(HISTORY)), completer=Slash(),
                             complete_while_typing=True, key_bindings=kb, bottom_toolbar=toolbar,
-                            style=style, refresh_interval=0.5)
+                            style=style, refresh_interval=0.25, placeholder=placeholder)
+    LIVE.invalidate = lambda: session.app.invalidate() if session.app.is_running else None
+
+    def refill():
+        # runs once the prompt is up, i.e. after prompt_toolkit took over Ctrl+C: messages
+        # given back by an earlier Ctrl+C (signal handler) can't miss this prompt
+        text, LIVE.refill = LIVE.refill, ""
+        if text:
+            session.default_buffer.insert_text(text)
 
     def read():
-        print()
-        return session.prompt(message)
+        if not LIVE.busy:
+            print()
+        return session.prompt(message, pre_run=refill)
+    read.live = sys.stdout.isatty()     # the prompt can stay open while tai works
     return read
 
 
@@ -1669,92 +1895,188 @@ def model_window(model):
     threading.Thread(target=look, daemon=True).start()
 
 
+def stop_turn():
+    """Ctrl+C while tai works: stop the running turn at once. Returns unsent queued messages."""
+    CANCEL.set()
+    abort_streams()
+    queued = take_inbox()
+    say("  [interrupted]" + (" · your queued message is back in the input" if queued else ""), "red")
+    return queued
+
+
+# commands that make sense while tai is working (others change what the turn is working on)
+BUSY_OK = {"/btw", "/mode", "/usage", "/help", "/model", "/models", "/file", "/save", "/exit", "/quit", "/q"}
+
+
 def repl(conv, perms, markdown, pending=None):
     pending = pending or []
     welcome(conv, perms)
     model_window(conv["model"])
     reader = make_reader(conv, perms)
-    try:
-        while True:
-            try:
-                text = reader().strip()
-            except EOFError:
-                break
-            if not text:
-                continue
+    live = getattr(reader, "live", False)
+    worker = None
 
-            if text.startswith("/"):
-                cmd, _, arg = text.partition(" ")
-                arg = arg.strip()
-                if cmd in ("/exit", "/quit", "/q"):
-                    break
-                elif cmd == "/help":
-                    print(HELP)
-                elif cmd == "/models":
-                    print_models(conv["model"])
-                elif cmd == "/model":
-                    if arg:
-                        conv["model"] = arg
-                        model_window(arg)
-                    dim(f"model: {conv['model']}")
-                elif cmd == "/mode":
-                    if arg and arg not in MODES:
-                        err(f"unknown mode {arg} — use one of: {', '.join(MODES)}")
-                        continue
-                    if arg:
-                        perms.mode = arg
-                    dim(f"mode: {perms.mode} — {MODE_INFO[perms.mode]}"
-                        + ("" if arg else f"  (shift+tab or /mode {'|'.join(MODES)})"))
-                elif cmd == "/usage":
-                    dim(f"session: {human(USAGE.inp)} in · {human(USAGE.out)} out · "
-                        f"{human(USAGE.inp + USAGE.out)} total"
-                        + (f" · {USAGE.ctx_text()}" if USAGE.ctx_text() else ""))
-                elif cmd == "/btw":
-                    if not arg:
-                        err("usage: /btw QUESTION")
-                        continue
-                    btw(conv, markdown, arg)
-                elif cmd == "/tools":
-                    conv["tools"] = not conv["tools"]
-                    reset_system(conv)
-                    dim(f"tools {'on (agent mode)' if conv['tools'] else 'off (chat mode)'}")
-                elif cmd == "/clear":
-                    conv["messages"] = conv["messages"][:1]
-                    USAGE.ctx = 0
-                    pending.clear()
-                    dim("conversation cleared")
-                elif cmd == "/system":
-                    if arg:
-                        conv["extra_system"] = arg
-                        reset_system(conv)
-                        dim("instructions set")
-                    else:
-                        dim(conv.get("extra_system") or "(no extra instructions)")
-                elif cmd == "/file":
-                    try:
-                        pending.append(read_file_block(arg))
-                        dim(f"attached {arg} (sent with your next message)")
-                    except RuntimeError as e:
-                        err(str(e))
-                elif cmd == "/save":
-                    if not arg:
-                        err("usage: /save PATH")
-                        continue
-                    try:
-                        Path(arg).expanduser().write_text(to_markdown(conv), encoding="utf-8")
-                        dim(f"saved to {arg}")
-                    except OSError as e:
-                        err(f"cannot save: {e.strerror}")
-                else:
-                    err(f"unknown command {cmd} — /help")
-                continue
-
-            content = "\n\n".join(pending + [text])
-            pending.clear()
+    def start(content):
+        """Run the turn, then any messages queued meanwhile; in the background when live."""
+        nonlocal worker
+        if not live:
             ask(conv, perms, markdown, content)
+            return
+
+        def run():
+            c = content
+            try:
+                while True:
+                    ask(conv, perms, markdown, c)
+                    with INBOX_LOCK:
+                        # stop_turn() took what was queued before Ctrl+C; anything here was
+                        # typed after it (while the stopped turn wound down): run it
+                        if INBOX:
+                            c = "\n\n".join(INBOX)
+                            INBOX.clear()
+                            continue
+                        LIVE.busy = False
+                        break
+            except Exception as e:      # never leave the prompt in 'working' state
+                err(f"tai: internal error: {e}")
+            finally:
+                LIVE.busy, LIVE.status = False, None
+                LIVE.invalidate()
+        LIVE.busy = True
+        worker = threading.Thread(target=run, daemon=True, name="tai-turn")
+        worker.start()
+
+    def finish():
+        if LIVE.busy:
+            stop_turn()
+        if worker:
+            worker.join(15)
+
+    if live:
+        from prompt_toolkit.patch_stdout import patch_stdout
+        screen = patch_stdout(raw=True)
+        LIVE.active = True
+    else:
+        screen = contextlib.nullcontext()
+    try:
+        with screen:
+            _repl_loop(conv, perms, markdown, pending, reader, start)
+            finish()
     finally:
+        LIVE.active = False
         if len(conv["messages"]) > 1:
             say("\n  Bye! Resume this conversation with  tai -c", GREY)
+
+
+def interrupted():
+    """Ctrl+C that reached tai's own code (between two prompts): same as the key."""
+    if LIVE.busy:
+        LIVE.refill = "\n\n".join(filter(None, [LIVE.refill, *stop_turn()]))
+
+
+def _repl_loop(conv, perms, markdown, pending, reader, start):
+    while True:
+        try:
+            text = reader().strip()
+            if _repl_line(text, conv, perms, markdown, pending, start) == "exit":
+                break
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            interrupted()
+
+
+def _repl_line(text, conv, perms, markdown, pending, start):
+    """Handle one line typed at the prompt. Returns "exit" to end the session."""
+    if LIVE.answer(text):           # the answer to an approval asked by the running turn
+        return
+    if not text:
+        return
+    busy = LIVE.busy
+    if text.startswith("/"):
+        cmd, _, arg = text.partition(" ")
+        arg = arg.strip()
+        if busy and cmd not in BUSY_OK:
+            err(f"{cmd} has to wait until tai is done (ctrl+c stops it)")
+            return
+        if cmd in ("/exit", "/quit", "/q"):
+            return "exit"
+        elif cmd == "/help":
+            print(HELP)
+        elif cmd == "/models":
+            print_models(conv["model"])
+        elif cmd == "/model":
+            if arg:
+                conv["model"] = arg
+                model_window(arg)
+            dim(f"model: {conv['model']}")
+        elif cmd == "/mode":
+            if arg and arg not in MODES:
+                err(f"unknown mode {arg} — use one of: {', '.join(MODES)}")
+                return
+            if arg:
+                perms.mode = arg
+            dim(f"mode: {perms.mode} — {MODE_INFO[perms.mode]}"
+                + ("" if arg else f"  (shift+tab or /mode {'|'.join(MODES)})"))
+        elif cmd == "/usage":
+            dim(f"session: {human(USAGE.inp)} in · {human(USAGE.out)} out · "
+                f"{human(USAGE.inp + USAGE.out)} total"
+                + (f" · {USAGE.ctx_text()}" if USAGE.ctx_text() else ""))
+        elif cmd == "/btw":
+            if not arg:
+                err("usage: /btw QUESTION")
+                return
+            if LIVE.active:      # answered alongside whatever tai is doing
+                threading.Thread(target=btw, args=(conv, markdown, arg), daemon=True).start()
+            else:
+                btw(conv, markdown, arg)
+        elif cmd == "/tools":
+            conv["tools"] = not conv["tools"]
+            reset_system(conv)
+            dim(f"tools {'on (agent mode)' if conv['tools'] else 'off (chat mode)'}")
+        elif cmd == "/clear":
+            conv["messages"] = conv["messages"][:1]
+            USAGE.ctx = 0
+            pending.clear()
+            dim("conversation cleared")
+        elif cmd == "/system":
+            if arg:
+                conv["extra_system"] = arg
+                reset_system(conv)
+                dim("instructions set")
+            else:
+                dim(conv.get("extra_system") or "(no extra instructions)")
+        elif cmd == "/file":
+            try:
+                pending.append(read_file_block(arg))
+                dim(f"attached {arg} (sent with your next message)")
+            except RuntimeError as e:
+                err(str(e))
+        elif cmd == "/save":
+            if not arg:
+                err("usage: /save PATH")
+                return
+            try:
+                Path(arg).expanduser().write_text(to_markdown(conv), encoding="utf-8")
+                dim(f"saved to {arg}")
+            except OSError as e:
+                err(f"cannot save: {e.strerror}")
+        else:
+            err(f"unknown command {cmd} — /help")
+        return
+
+    content = "\n\n".join(pending + [text])
+    pending.clear()
+    with INBOX_LOCK:
+        if LIVE.busy:
+            INBOX.append(content)
+            queued = True
+        else:
+            queued = False
+    if queued:
+        dim("  queued · tai reads it at its next step (ctrl+c stops tai and gives it back)")
+    else:
+        start(content)
 
 
 def print_models(current=None):

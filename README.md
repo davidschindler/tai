@@ -43,7 +43,8 @@ tai
 ## Using it
 
 - **Approvals:** file edits, commands and web page fetches ask first: *1* yes, *2* yes and don't ask again, *3* no (and tell tai what to do instead). `Shift+Tab` switches between *manual*, *accept edits* and *auto*.
-- `@file` attaches a file, `/` lists commands (`/btw` for a side question, `/model`, `/compact`, `/rewind`, …), `Esc` stops tai.
+- `@file` attaches a file, `/` lists commands (`/btw` for a side question, `/model`, `/compact`, `/rewind`, …), `Esc` stops tai (`Ctrl+C` in the terminal).
+- **While tai works** you can keep typing: `/btw QUESTION` is answered right away without disturbing the task, and a normal message is read at tai's next step.
 - Commands run in **bash** on macOS/Linux and in **PowerShell** on Windows.
 - Conversations are saved locally (`%LOCALAPPDATA%\tai` on Windows, `~/.local/state/tai` elsewhere). `tai -c` continues the last one.
 
@@ -54,8 +55,8 @@ tai
 `tai.py` is the whole program (the `tai` command, and `tai --serve` for the extension); `vscode/` is the extension; `tests/` tests tai.
 
 ```
-pip install pytest rich prompt_toolkit
-python -m pytest tests            # tai: protocol, terminal program, per-OS behaviour
+pip install pytest pexpect rich prompt_toolkit
+python -m pytest tests            # tai: protocol, terminal program and session, per-OS behaviour
 cd vscode && npm install && npm test
 ```
 
