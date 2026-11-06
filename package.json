@@ -179,7 +179,7 @@
     "test:webview": "node test/webview/run.mjs",
     "test:vscode": "node test/vscode/run.mjs",
     "test": "npm run typecheck && npm run build && npm run test:python && npm run test:webview && npm run test:vscode",
-    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository --skip-license"
+    "package": "node esbuild.mjs --minify && vsce package --no-dependencies --allow-missing-repository --skip-license"
   },
   "devDependencies": {
     "@types/diff": "^5.2.3",

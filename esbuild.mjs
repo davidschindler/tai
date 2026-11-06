@@ -14,7 +14,7 @@ const builds = [
     external: ["vscode", "mocha"], target: "node18" },
 ];
 for (const b of builds) {
-  const opts = { bundle: true, sourcemap: true, minify: false, logLevel: "info", ...b };
+  const opts = { bundle: true, sourcemap: true, minify: process.argv.includes("--minify"), logLevel: "info", ...b };
   if (watch) await (await esbuild.context(opts)).watch();
   else await esbuild.build(opts);
 }
