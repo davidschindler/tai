@@ -464,6 +464,11 @@ describe("screenshots", function () {
     await until(() => !ext.sidebar.busy, 15000, "idle");
     await sleep(1200);
     shot("vscode-done");
+    await vscode.commands.executeCommand("tai.openInNewTab");
+    await until(() => ext.panels.size === 1, 5000, "tab");
+    await sleep(2500);
+    shot("vscode-tab");
+    for (const p of ext.panels.values()) p.dispose();
   });
 });
 

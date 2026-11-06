@@ -49,6 +49,21 @@ describe("webview", { concurrency: false }, () => {
     }
   });
 
+  it("shows the Tilburg University emblem that suits the theme", async () => {
+    for (const [theme, want] of [["dark", "logo-dark"], ["light", "logo-light"]]) {
+      const h = await harness({ theme });
+      await h.waitSel(".empty .logo");
+      const shown = await h.page.$$eval(".empty .logo", (imgs) =>
+        imgs.filter((i) => getComputedStyle(i).display !== "none")
+          .map((i) => ({ cls: i.className, w: i.naturalWidth, box: i.getBoundingClientRect().width })));
+      assert.equal(shown.length, 1, theme + ": exactly one logo visible");
+      assert.match(shown[0].cls, new RegExp(want));
+      assert.ok(shown[0].w > 0, "image loaded");
+      assert.equal(shown[0].box, 64);
+      await done(h);
+    }
+  });
+
   it("sends a message and renders the streamed answer", async () => {
     const h = await harness();
     await h.sendText("hello tai");

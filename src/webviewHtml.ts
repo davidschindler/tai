@@ -4,7 +4,8 @@ import * as vscode from "vscode";
 export function webviewHtml(webview: vscode.Webview, extUri: vscode.Uri): string {
   const nonce = crypto.randomBytes(16).toString("base64");
   const script = webview.asWebviewUri(vscode.Uri.joinPath(extUri, "dist", "webview.js"));
-  const logo = webview.asWebviewUri(vscode.Uri.joinPath(extUri, "media", "tai-logo.svg"));
+  const media = (f: string) => webview.asWebviewUri(vscode.Uri.joinPath(extUri, "media", f));
+  const logo = media("tai-logo-light.png"), logoDark = media("tai-logo-dark.png");
   const csp = [
     "default-src 'none'",
     `img-src ${webview.cspSource} data:`,       // no remote images: they could leak data in URLs
@@ -21,7 +22,7 @@ export function webviewHtml(webview: vscode.Webview, extUri: vscode.Uri): string
 <title>tai</title>
 </head>
 <body>
-<div id="app" data-logo="${logo}"></div>
+<div id="app" data-logo="${logo}" data-logo-dark="${logoDark}"></div>
 <script nonce="${nonce}" src="${script}"></script>
 </body>
 </html>`;

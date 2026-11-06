@@ -101,7 +101,8 @@ class Extension implements vscode.Disposable {
   openPanel(sessionId?: string, existing?: vscode.WebviewPanel): ChatController {
     const panel = existing ?? vscode.window.createWebviewPanel(PANEL_TYPE, "tai", vscode.ViewColumn.Beside, {
       enableScripts: true, retainContextWhenHidden: true });
-    panel.iconPath = vscode.Uri.joinPath(this.ctx.extensionUri, "media", "tai-tab.svg");
+    const icon = (f: string) => vscode.Uri.joinPath(this.ctx.extensionUri, "media", f);
+    panel.iconPath = { light: icon("tai-tab-light.png"), dark: icon("tai-tab-dark.png") };
     const c = new ChatController(this.shared, sessionId);
     this.panels.set(c, panel);
     c.onSession = (s) => {

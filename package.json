@@ -2,7 +2,7 @@
   "name": "tai-vscode",
   "displayName": "tai — Tilburg.ai agent",
   "description": "Chat with tai, your Tilburg.ai coding and research agent, right inside VS Code: edits with diffs, approvals, sub-agents, web search, sessions and checkpoints.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "publisher": "davidschindler",
   "license": "UNLICENSED",
   "private": true,

@@ -53,6 +53,7 @@ document.head.append(style);
 
 const app = document.getElementById("app")!;
 const LOGO = app.dataset.logo ?? "";
+const LOGO_DARK = app.dataset.logoDark ?? LOGO;
 app.innerHTML = `
   <div id="banner" hidden></div>
   <div id="scroller"><div id="messages"></div><div id="thinking" hidden></div></div>
@@ -127,7 +128,8 @@ function showEmpty() {
   if (messages.children.length) return;
   const e = el("div", "empty");
   e.innerHTML = `
-    <img class="logo" src="${LOGO}" alt="">
+    <img class="logo logo-light" src="${LOGO}" alt="">
+    <img class="logo logo-dark" src="${LOGO_DARK}" alt="">
     <h2>What can tai do for you?</h2>
     <p class="dim">tai reads and edits files, runs commands, searches the web and starts sub-agents.
     It asks before it changes anything (see the mode below).</p>

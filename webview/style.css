@@ -39,7 +39,11 @@ kbd { font-family: var(--mono); font-size: .85em; border: 1px solid var(--border
 #scroller { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 10px 12px 4px; scroll-behavior: auto; }
 #messages { display: flex; flex-direction: column; gap: 10px; }
 .empty { text-align: center; padding: 28px 12px; color: var(--dim); }
-.empty .logo { width: 56px; height: 56px; margin-bottom: 4px; }
+.empty .logo { width: 64px; height: 64px; margin-bottom: 4px; }
+/* Tilburg University emblem: navy tree on light themes, light tree on dark ones */
+.empty .logo-dark { display: none; }
+body.vscode-dark .empty .logo-dark, body.vscode-high-contrast:not(.vscode-high-contrast-light) .empty .logo-dark { display: inline; }
+body.vscode-dark .empty .logo-light, body.vscode-high-contrast:not(.vscode-high-contrast-light) .empty .logo-light { display: none; }
 .empty h2 { color: var(--fg); font-size: 1.15em; font-weight: 600; margin: 6px 0; }
 .empty .tips { list-style: none; padding: 0; margin: 14px 0 0; display: flex; flex-direction: column; gap: 6px; font-size: .92em; }
 

@@ -81,9 +81,10 @@ export class Harness {
     await page.exposeFunction("__toHost", (m) => this.onWebview(m));
     const t = THEMES[this.theme];
     const vars = Object.entries(t.vars).map(([k, v]) => `${k}:${v}`).join(";");
-    const logo = "data:image/svg+xml;base64," + fs.readFileSync(path.join(ROOT, "media/tai-logo.svg")).toString("base64");
+    const png = (f) => "data:image/png;base64," + fs.readFileSync(path.join(ROOT, "media", f)).toString("base64");
+    const logo = png("tai-logo-light.png"), logoDark = png("tai-logo-dark.png");
     const html = `<!DOCTYPE html><html style="${vars}"><head><meta charset="utf-8"></head>
-      <body class="${t.cls}"><div id="app" data-logo="${logo}"></div>
+      <body class="${t.cls}"><div id="app" data-logo="${logo}" data-logo-dark="${logoDark}"></div>
       <script>
         let st = {};
         window.acquireVsCodeApi = () => ({ postMessage: (m) => window.__toHost(m), getState: () => st, setState: (s) => { st = s; } });
