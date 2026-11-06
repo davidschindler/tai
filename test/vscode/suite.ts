@@ -76,16 +76,18 @@ function diffTabs(): vscode.Tab[] {
 let ext: any;
 let probe: Probe;
 
+before(async function () {
+  this.timeout(60000);
+  const e = vscode.extensions.getExtension("davidschindler.tai-vscode")!;
+  const api = await e.activate();
+  ext = api.ext;
+  await vscode.commands.executeCommand("tai.openSidebar");
+  await until(() => ext.sidebar, 10000, "sidebar controller");
+  probe = new Probe(ext.sidebar);
+  await until(() => ext.sidebar.state, 20000, "tai to start");
+});
+
 describe("tai extension", function () {
-  before(async function () {
-    const e = vscode.extensions.getExtension("davidschindler.tai-vscode")!;
-    const api = await e.activate();
-    ext = api.ext;
-    await vscode.commands.executeCommand("tai.openSidebar");
-    await until(() => ext.sidebar, 10000, "sidebar controller");
-    probe = new Probe(ext.sidebar);
-    await until(() => ext.sidebar.state, 20000, "tai to start");
-  });
 
   afterEach(async () => {
     await vscode.commands.executeCommand("workbench.action.closeAllEditors");
@@ -329,6 +331,54 @@ describe("tai extension", function () {
     await until(() => ext.panels.size === 0, 5000, "panel disposed");
   });
 
+  it("keeps approvals of two chats apart", async () => {
+    await vscode.commands.executeCommand("tai.openInNewTab");
+    const b: ChatController = await until(() => [...ext.panels.keys()][0], 5000, "panel") as ChatController;
+    const pb = new Probe(b);
+    await until(() => b.state, 20000, "panel tai");
+    await ext.sidebar.newSession();
+    await ext.sidebar.restart();            // fresh process: both number their requests from s1
+    await until(() => (ext.sidebar as any).client?.running && ext.sidebar.state, 10000, "restarted");
+    fs.writeFileSync(path.join(WS, "same.txt"), "A\n");
+    const ma = probe.mark(), mb = pb.mark();
+    const edit = (n: string) => mock({ tools: [{ name: "edit_file", args: { path: "same.txt", old_string: "A", new_string: n } }] }, { text: "ok" });
+    await probe.webview({ type: "send", text: edit("FROM_SIDEBAR"), clientId: "x1", includeContext: false });
+    await until(() => diffTabs().length === 1, 15000, "first diff");
+    await pb.webview({ type: "send", text: edit("FROM_TAB"), clientId: "x2", includeContext: false });
+    await until(() => diffTabs().length === 2, 15000, "two diffs");
+    const apA = probe.since(ma, "approval")[0], apB = pb.since(mb, "approval")[0];
+    assert.strictEqual(apA.requestId, apB.requestId, "both processes use the same request id");
+    const docs = await Promise.all(diffTabs().map((t) => vscode.workspace.openTextDocument((t.input as vscode.TabInputTextDiff).modified)));
+    assert.deepStrictEqual(docs.map((d) => d.getText()).sort(), ["FROM_SIDEBAR\n", "FROM_TAB\n"]);
+    const tB = diffTabs()[docs.findIndex((d) => d.getText() === "FROM_TAB\n")];
+    await vscode.commands.executeCommand("vscode.diff", (tB.input as vscode.TabInputTextDiff).original, (tB.input as vscode.TabInputTextDiff).modified);
+    await vscode.commands.executeCommand("tai.acceptDiff");
+    await pb.turnEnd(mb);
+    assert.strictEqual(fs.readFileSync(path.join(WS, "same.txt"), "utf8"), "FROM_TAB\n");
+    assert.strictEqual(diffTabs().length, 1, "the side bar's diff is still open");
+    await probe.webview({ type: "approve", requestId: apA.requestId, decision: "yes" });
+    const endA = await probe.turnEnd(ma);
+    assert.strictEqual(endA.reason, "done");
+    assert.match(probe.since(ma, "tool_end")[0].summary, /changed while waiting/);
+    const idB = b.state!.session.id;
+    await ext.sidebar.loadSession(idB);
+    assert.notStrictEqual(ext.sidebar.state.session.id, idB, "same conversation not opened twice");
+    ext.panels.get(b).dispose();
+    await until(() => ext.panels.size === 0, 5000, "panel closed");
+  });
+
+  it("/compact while busy reports back instead of hanging", async () => {
+    const m = probe.mark();
+    await probe.webview({ type: "send", text: mock({ text: "x", hang: 20 }), clientId: "cb", includeContext: false });
+    await until(() => ext.sidebar.busy, 5000, "busy");
+    await probe.webview({ type: "command", name: "compact", arg: "" });
+    const e = probe.since(m, "compact_end")[0];
+    assert.ok(e && /Stop the current task/.test(e.error));
+    await probe.webview({ type: "cancel" });
+    await probe.turnEnd(m);
+    assert.strictEqual(ext.sidebar.busy, false);
+  });
+
   it("recovers when the tai process dies", async () => {
     const client = (ext.sidebar as any).client;
     const id = ext.sidebar.state.session.id;
@@ -383,5 +433,96 @@ describe("tai extension", function () {
   it("exports the conversation with /save", async () => {
     await probe.webview({ type: "command", name: "save", arg: "export.md" });
     assert.match(fs.readFileSync(path.join(WS, "export.md"), "utf8"), /## You/);
+  });
+});
+
+// Optional: screenshots of the real VS Code window (set TAI_SHOTS to a folder; needs ImageMagick `import`).
+describe("screenshots", function () {
+  const dir = process.env.TAI_SHOTS;
+  before(function () {
+    if (!dir) this.skip();
+  });
+  const shot = (name: string) =>
+    require("child_process").execSync(`import -window root ${JSON.stringify(path.join(dir!, name + ".png"))}`);
+
+  it("captures the chat with a pending edit", async () => {
+    fs.mkdirSync(dir!, { recursive: true });
+    await vscode.commands.executeCommand("workbench.action.closeAllEditors");
+    await ext.sidebar.newSession();
+    const f = path.join(WS, "analysis.py");
+    fs.writeFileSync(f, "import pandas as pd\n\ndef load(path):\n    df = pd.read_csv(path)\n    return df.dropna()\n\nprint(load('data.csv').describe())\n");
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(f));
+    await probe.send(mock({ text: "Let me look at the script first.", tools: [{ name: "read_file", args: { path: "analysis.py" } }] },
+      { text: "The script drops **all** rows with any missing value. I'll only drop rows where `income` is missing:" ,
+        tools: [{ name: "edit_file", args: { path: "analysis.py", old_string: "    return df.dropna()", new_string: "    # keep rows with partial data; income is required\n    return df.dropna(subset=[\"income\"])" } }] },
+      { text: "Done. `analysis.py:5` now keeps rows that only miss other columns." }), false, 3000).catch(() => undefined);
+    await until(() => diffTabs().length === 1, 15000, "diff tab");
+    await sleep(1500);
+    shot("vscode-approval");
+    const ap = [...probe.posted].reverse().find((x) => x.type === "approval") as any;
+    await probe.webview({ type: "approve", requestId: ap.requestId, decision: "yes" });
+    await until(() => !ext.sidebar.busy, 15000, "idle");
+    await sleep(1200);
+    shot("vscode-done");
+  });
+});
+
+// Opt-in end-to-end run against the REAL Tilburg.ai API (TAI_REAL=1; uses your key, costs a few cents).
+describe("real API", function () {
+  before(function () {
+    if (!process.env.TAI_REAL) this.skip();
+  });
+  this.timeout(240000);
+
+  it("creates and runs a file in auto mode", async () => {
+    await ext.sidebar.newSession();
+    await probe.webview({ type: "setMode", mode: "auto" });
+    const end = await probe.send("Create greet.py with a function greet(name) that returns 'Hello, ' + name + '!' and " +
+      "prints greet('Tilburg') when run. Then run it with python3 and tell me the exact output.", false, 200000);
+    assert.strictEqual(end.reason, "done", end.error);
+    assert.match(fs.readFileSync(path.join(WS, "greet.py"), "utf8"), /def greet/);
+    const tools = probe.events("tool_start").map((e: any) => e.name);
+    assert.ok(tools.includes("write_file") && tools.includes("bash"), tools.join(","));
+    const text = probe.events("text").map((e: any) => e.delta).join("");
+    assert.match(text, /Hello, Tilburg!/);
+  });
+
+  it("asks before editing in manual mode; accepted from the diff editor", async () => {
+    await probe.webview({ type: "setMode", mode: "manual" });
+    const m = probe.mark();
+    await probe.webview({ type: "send", text: "In greet.py change the greeting word from Hello to Hi. Only that change; don't run anything.", clientId: "real2", includeContext: false });
+    const tab = await until(() => diffTabs()[0], 200000, "diff tab");
+    await vscode.commands.executeCommand("vscode.diff", (tab.input as vscode.TabInputTextDiff).original,
+      (tab.input as vscode.TabInputTextDiff).modified);
+    await vscode.commands.executeCommand("tai.acceptDiff");
+    const end = await probe.turnEnd(m, 200000);
+    assert.strictEqual(end.reason, "done", end.error);
+    assert.match(fs.readFileSync(path.join(WS, "greet.py"), "utf8"), /Hi, /);
+  });
+
+  it("runs sub-agents", async () => {
+    await probe.webview({ type: "setMode", mode: "auto" });
+    const m = probe.mark();
+    const end = await probe.send("Use the task tool to start two sub-agents in parallel: one reports how many lines greet.py has, " +
+      "the other lists the files in this folder. Then summarize both reports in two bullet points.", false, 220000);
+    assert.strictEqual(end.reason, "done", end.error);
+    assert.ok(probe.since(m, "task_end").length >= 2, "two sub-agents finished");
+  });
+
+  it("answers /btw and can be stopped mid-answer", async () => {
+    const m = probe.mark();
+    await probe.webview({ type: "btw", question: "In one word: what language is greet.py written in?", id: "rb" });
+    const b = await until(() => probe.since(m, "btw_end")[0], 120000, "btw_end");
+    assert.strictEqual(b.error, null);
+    assert.match(probe.since(m, "btw_text").map((e: any) => e.delta).join(""), /python/i);
+    const m2 = probe.mark();
+    await probe.webview({ type: "send", text: "Write a 1500-word essay about the history of Tilburg.", clientId: "rc", includeContext: false });
+    await until(() => probe.since(m2, "turn_start").length, 30000, "turn start");
+    await sleep(5000);                       // thinking or streaming: either way Stop must work at once
+    await probe.webview({ type: "cancel" });
+    const t = Date.now();
+    const end = await probe.turnEnd(m2, 10000);
+    assert.strictEqual(end.reason, "cancelled");
+    assert.ok(Date.now() - t < 2000, "stopped quickly");
   });
 });

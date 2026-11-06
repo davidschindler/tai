@@ -51,8 +51,21 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
 /** Markdown → sanitized HTML. */
 export function mdToHtml(text: string): string {
   const html = marked.parse(text, { async: false }) as string;
-  return DOMPurify.sanitize(html, { USE_PROFILES: { html: true }, FORBID_TAGS: ["style", "form", "input"],
-    FORBID_ATTR: ["style"] });
+  const frag = DOMPurify.sanitize(html, { USE_PROFILES: { html: true }, FORBID_TAGS: ["style", "form", "input"],
+    FORBID_ATTR: ["style"], RETURN_DOM_FRAGMENT: true });
+  // Remote images are never loaded (their URLs could carry conversation data): show links instead.
+  // This runs on the inert fragment, before anything reaches the live page.
+  frag.querySelectorAll("img").forEach((img) => {
+    const src = img.getAttribute("src") ?? "";
+    if (src.startsWith("data:image/")) return;
+    const a = document.createElement("a");
+    a.textContent = `[image: ${img.getAttribute("alt") || src}]`;
+    if (/^https?:/i.test(src)) a.href = src;
+    img.replaceWith(a);
+  });
+  const box = document.createElement("div");
+  box.append(frag);
+  return box.innerHTML;
 }
 
 const PATH_RE = /^(?:~|\.{1,2})?\/?(?:[\w.@+-]+\/)*[\w.@+-]+\.[A-Za-z0-9]{1,8}(?::(\d+)(?:[-:]\d+)?)?$/;

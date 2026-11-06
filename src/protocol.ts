@@ -39,7 +39,7 @@ export interface FileDiff {
 
 export type TranscriptItem =
   | { type: "user"; index: number; text: string; files: string[]; context: string; kind: string; time?: number }
-  | { type: "assistant"; text: string }
+  | { type: "assistant"; text: string; streaming?: boolean }
   | { type: "tool"; id: string; name: string; label: string; shown: string; args: Record<string, unknown>;
       output: string; summary: string; error: boolean; done: boolean }
   | { type: "task"; id: string; label: string; prompt: string; result: string; done: boolean };

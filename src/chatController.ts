@@ -20,7 +20,11 @@ export interface Shared {
   files: FileIndex;
   busyChanged: () => void;
   focused: (c: ChatController, focused: boolean) => void;
+  /** Another chat already shows this session: focus it and return true. */
+  revealSession: (c: ChatController, sessionId: string) => boolean;
 }
+
+let nextControllerId = 1;
 
 interface PendingApproval {
   params: ApprovalParams;
@@ -81,6 +85,8 @@ export class ChatController implements vscode.Disposable {
   private modeInfo: Record<string, string> = {};
   private version = "";
   private disposed = false;
+  /** Prefix for approval ids: every tai process numbers its requests s1, s2, … */
+  private readonly uid = `c${nextControllerId++}`;
   private subs: vscode.Disposable[] = [];
   state?: TaiState;
   readonly cwd: string;
@@ -260,7 +266,7 @@ export class ChatController implements vscode.Disposable {
   private dropApprovals() {
     for (const [id, a] of this.approvals) {
       a.resolve(null);
-      this.shared.diffs.close(id);
+      this.shared.diffs.close(this.diffKey(id));
       this.post({ type: "approvalDone", requestId: id });
     }
     this.approvals.clear();
@@ -303,7 +309,7 @@ export class ChatController implements vscode.Disposable {
         if (a) {
           this.approvals.delete(e.requestId);
           a.resolve(null);
-          this.shared.diffs.close(e.requestId);
+          this.shared.diffs.close(this.diffKey(e.requestId));
           this.post({ type: "approvalDone", requestId: e.requestId });
           if (!this.approvals.size) this.shared.busyChanged();
         }
@@ -323,7 +329,10 @@ export class ChatController implements vscode.Disposable {
       case "ide/diagnostics":
         return this.diagnostics(params?.path ?? null);
       case "ide/saveFile": {
-        const doc = vscode.workspace.textDocuments.find((d) => d.uri.scheme === "file" && d.uri.fsPath === params?.path);
+        const real = (p: string) => { try { return fs.realpathSync(p); } catch { return p; } };
+        const want = real(String(params?.path ?? ""));
+        const doc = vscode.workspace.textDocuments.find((d) => d.uri.scheme === "file" &&
+          (d.uri.fsPath === params?.path || real(d.uri.fsPath) === want));
         if (doc?.isDirty) await doc.save();
         return {};
       }
@@ -340,7 +349,7 @@ export class ChatController implements vscode.Disposable {
       this.onAttention?.("approval");
       const d = params.detail;
       if (d.type === "edit" && d.path && typeof d.new === "string" && config().get("autoOpenDiff", true)) {
-        this.shared.diffs.openProposal(id, d.path, d.old ?? null, d.new, (dec) => this.decide(id, dec))
+        this.shared.diffs.openProposal(this.diffKey(id), d.path, d.old ?? null, d.new, (dec) => this.decide(id, dec))
           .catch((err) => this.shared.log(`diff failed: ${err}`));
       }
     });
@@ -351,9 +360,13 @@ export class ChatController implements vscode.Disposable {
     if (!a) return;
     this.approvals.delete(id);
     a.resolve({ decision, feedback: feedback ?? "" });
-    this.shared.diffs.close(id);
+    this.shared.diffs.close(this.diffKey(id));
     this.post({ type: "approvalDone", requestId: id });
     this.shared.busyChanged();
+  }
+
+  private diffKey(requestId: string): string {
+    return `${this.uid}-${requestId}`;
   }
 
   ownsApproval(id: string): boolean {
@@ -415,7 +428,7 @@ export class ChatController implements vscode.Disposable {
           const a = this.approvals.get(m.requestId);
           const d = a?.params.detail;
           if (d?.path && typeof d.new === "string") {
-            await this.shared.diffs.openProposal(m.requestId, d.path, d.old ?? null, d.new,
+            await this.shared.diffs.openProposal(this.diffKey(m.requestId), d.path, d.old ?? null, d.new,
               (dec) => this.decide(m.requestId!, dec), false);
           }
         } else if (m.diff) {
@@ -514,6 +527,10 @@ export class ChatController implements vscode.Disposable {
   async loadSession(id: string): Promise<void> {
     if (!(await this.ensureStarted())) return;
     if (id === this.state?.session.id) return;
+    if (this.shared.revealSession(this, id)) {
+      vscode.window.showInformationMessage("That conversation is already open in another tai chat.");
+      return;
+    }
     if (!(await this.stopIfBusy("open another conversation"))) return;
     const r = await this.client!.call("load_session", { id }, 15000);
     this.state = r.state;
@@ -747,8 +764,16 @@ export class ChatController implements vscode.Disposable {
   }
 
   // ------------------------------------------------------------------ slash commands handled here
+  private compactFailed(error: string) {
+    this.post({ type: "event", event: { type: "compact_end", error, transcript: null,
+      usage: this.state?.usage ?? { input: 0, output: 0, ctx: 0, maxCtx: null } } });
+  }
+
   private async command(name: string, arg: string) {
-    if (!(await this.ensureStarted())) return;
+    if (!(await this.ensureStarted())) {
+      if (name === "compact") this.compactFailed("tai is not running");
+      return;
+    }
     const c = this.client!;
     switch (name) {
       case "model":
@@ -772,13 +797,13 @@ export class ChatController implements vscode.Disposable {
         return this.notice("info", text ? "Instructions set" : "Instructions removed");
       }
       case "compact":
-        if (this.busy) return this.notice("warning", "Stop the current task first.");
+        if (this.busy) return this.compactFailed("Stop the current task first.");
+        this.setBusy(true);          // before the call: compact_end may arrive before its reply
         try {
           await c.call("compact", { instructions: arg }, 10000);
-          this.setBusy(true);
         } catch (e: any) {
-          this.post({ type: "event", event: { type: "compact_end", error: e.message, transcript: null,
-            usage: this.state!.usage } });
+          this.setBusy(false);
+          this.compactFailed(e.message);
         }
         return;
       case "usage": {

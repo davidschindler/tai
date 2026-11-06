@@ -16,11 +16,17 @@ const state = fs.mkdtempSync(path.join(os.tmpdir(), "tai-vscode-state-"));
 const apiBase = `http://127.0.0.1:${port}/v1`;
 // VS Code resolves the login shell's environment (which may hold the real key): pin the test
 // values through the extension's own setting, which takes precedence.
+const real = !!process.env.TAI_REAL;       // end-to-end against the real API with the user's key
 fs.mkdirSync(path.join(ws, ".vscode"));
 fs.writeFileSync(path.join(ws, ".vscode", "settings.json"), JSON.stringify({
-  "tai.environmentVariables": { TILBURG_AI_API_KEY: "test-key", TAI_API_BASE: apiBase, XDG_STATE_HOME: state },
+  "tai.environmentVariables": real ? { XDG_STATE_HOME: state }
+    : { TILBURG_AI_API_KEY: "test-key", TAI_API_BASE: apiBase, XDG_STATE_HOME: state },
 }));
-delete process.env.TILBURG_AI_API_KEY;
+if (!real) delete process.env.TILBURG_AI_API_KEY;
+// Keep the test window off the user's desktop: X11 only, on the display we were given.
+if (process.env.TAI_TEST_DISPLAY) process.env.DISPLAY = process.env.TAI_TEST_DISPLAY;
+delete process.env.WAYLAND_DISPLAY;
+process.env.ELECTRON_OZONE_PLATFORM_HINT = "x11";
 
 let code = 0;
 try {
@@ -29,9 +35,9 @@ try {
     extensionDevelopmentPath: ROOT,
     extensionTestsPath: path.join(ROOT, "dist/test/index.js"),
     launchArgs: [ws, "--disable-extensions", "--user-data-dir", userData, "--skip-welcome", "--skip-release-notes",
-      "--disable-workspace-trust", "--disable-gpu"],
+      "--disable-workspace-trust", "--disable-gpu", "--ozone-platform=x11"],
     extensionTestsEnv: {
-      TAI_API_BASE: apiBase, XDG_STATE_HOME: state,
+      ...(real ? { TAI_REAL: "1" } : { TAI_API_BASE: apiBase }), XDG_STATE_HOME: state,
       DISPLAY: process.env.TAI_TEST_DISPLAY || process.env.DISPLAY, ELECTRON_ENABLE_LOGGING: "",
     },
   });

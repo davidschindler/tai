@@ -5,6 +5,13 @@ import type { Attachment, EditorContext, FileHit } from "./protocol";
 
 const MAX_SELECTION = 20000;
 
+/** Cuts to at most `max` UTF-16 units without splitting a surrogate pair. */
+export function cutText(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const code = s.charCodeAt(max - 1);
+  return s.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
+}
+
 /** Selection → 1-based inclusive line range; a selection ending at column 0 excludes that line. */
 export function selectionLines(sel: vscode.Selection): { start: number; end: number } {
   let end = sel.end.line;
@@ -118,7 +125,7 @@ export class EditorTracker implements vscode.Disposable {
     const sel = e.selection;
     if (!sel.isEmpty) {
       const { start, end } = selectionLines(sel);
-      ctx.selection = { start, end, text: e.document.getText(sel).slice(0, MAX_SELECTION) };
+      ctx.selection = { start, end, text: cutText(e.document.getText(sel), MAX_SELECTION) };
     }
     return ctx;
   }

@@ -7,7 +7,7 @@ export function webviewHtml(webview: vscode.Webview, extUri: vscode.Uri): string
   const logo = webview.asWebviewUri(vscode.Uri.joinPath(extUri, "media", "tai-logo.svg"));
   const csp = [
     "default-src 'none'",
-    `img-src ${webview.cspSource} data: https:`,
+    `img-src ${webview.cspSource} data:`,       // no remote images: they could leak data in URLs
     `style-src ${webview.cspSource} 'unsafe-inline'`,
     `font-src ${webview.cspSource}`,
     `script-src 'nonce-${nonce}'`,

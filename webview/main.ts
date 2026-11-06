@@ -375,13 +375,18 @@ function renderTranscript(items: TranscriptItem[]) {
   assistant = null;
   for (const it of items) {
     if (it.type === "user") addUser(it.text, { index: it.index, files: it.files, context: it.context, time: it.time, kind: it.kind });
-    else if (it.type === "assistant") addAssistant(it.text);
-    else if (it.type === "tool") {
+    else if (it.type === "assistant") {
+      if (it.streaming) {          // the reply being written right now: keep appending to it
+        const a = startAssistant();
+        a.text = it.text;
+        renderMarkdown(a.body, a.text, hooks, false);
+      } else addAssistant(it.text);
+    } else if (it.type === "tool") {
       const row = toolRow(it.id, it.name, it.label, it.shown, it.args);
-      finishTool(row, it.summary || (it.error ? "failed" : "done"), it.error, it.output, null);
+      if (it.done) finishTool(row, it.summary || (it.error ? "failed" : "done"), it.error, it.output, null);
     } else if (it.type === "task") {
       addTask(it.id, it.label, it.prompt);
-      finishTask(it.id, it.result, it.result.startsWith("Sub-agent failed"));
+      if (it.done) finishTask(it.id, it.result, it.result.startsWith("Sub-agent failed"));
     }
   }
   showEmpty();
@@ -828,8 +833,8 @@ input.addEventListener("keydown", (e) => {
     }
   }
   if (e.key === "Escape") {
-    if (!menu.hidden) { e.preventDefault(); closeMenu(); return; }
-    if (S.busy || S.compacting) { e.preventDefault(); send({ type: "cancel" }); return; }
+    if (!menu.hidden) { e.preventDefault(); e.stopPropagation(); closeMenu(); return; }
+    if (S.busy || S.compacting) { e.preventDefault(); e.stopPropagation(); send({ type: "cancel" }); return; }
   }
   if (e.key === "Tab" && e.shiftKey) {
     e.preventDefault();
@@ -886,7 +891,8 @@ mentionBtn.addEventListener("click", () => {
 });
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && (S.busy || S.compacting) && document.activeElement?.tagName !== "INPUT" &&
+  if (e.key === "Escape" && !e.defaultPrevented && (S.busy || S.compacting) &&
+      !["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName ?? "") &&
       !approvalsEl.contains(document.activeElement)) {
     send({ type: "cancel" });
   }

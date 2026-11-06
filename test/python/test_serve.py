@@ -631,3 +631,119 @@ def test_cli_resume_vscode_session(api, tmp_path, client):
 def test_cli_models(api, tmp_path):
     r = _cli(api, tmp_path, "--models")
     assert "gpt-5.6-sol" in r.stdout and "400k ctx" in r.stdout
+
+
+# ---------------------------------------------------------------- regressions from the review
+
+def test_lone_surrogate_does_not_break_the_session(client):
+    c = client()
+    init(c)
+    m = c.mark()
+    # raw JSON with a lone high surrogate, as JSON.stringify produces for half an emoji
+    c.p.stdin.write('{"id": 900, "method": "send", "params": {"text": "half an emoji \\ud83d here", '
+                    '"context": {"path": "x.py", "selection": {"start": 1, "end": 1, "text": "\\ud83d"}}}}\n')
+    c.p.stdin.flush()
+    end = c.wait("turn_end", start=m)
+    assert end["reason"] == "done", end
+    assert "half an emoji" in c.text_since(m)
+    _, end, m = c.send(mock({"tools": [{"name": "bash", "args": {"command": "echo still ok"}}]}, {"text": "k"}))
+    assert "still ok" in c.wait("tool_end", start=m)["output"]      # approvals still reach the client
+    assert c.call("sessions")["sessions"]
+
+
+def test_bad_diagnostics_path_keeps_conversation_valid(client):
+    c = client()
+    init(c)
+    _, end, m = c.send(mock({"tools": [{"name": "get_diagnostics", "args": {"path": "a\u0000b"}}]}, {"text": "k"}))
+    assert end["reason"] == "done", end
+    assert c.wait("tool_end", start=m)["error"]
+    _, end, m = c.send("next")          # the strict mock rejects tool calls without results
+    assert end["reason"] == "done" and c.text_since(m) == "Echo: next"
+
+
+def test_internal_error_mid_turn_still_ends_turn_and_repairs_history(client):
+    c = client()
+    init(c)
+    c.ide["ide/diagnostics"] = lambda p: "not a list"
+    _, end, m = c.send(mock({"tools": [{"name": "get_diagnostics", "args": {}}, {"name": "list_files", "args": {"pattern": "*"}}]},
+                            {"text": "k"}))
+    assert end["reason"] == "done"
+    _, end, m = c.send("again")
+    assert end["reason"] == "done", end
+
+
+def test_compact_and_btw_forbid_tool_calls(client, api):
+    c = client()
+    init(c)
+    c.send("one")
+    reset_log(api)
+    m = c.mark()
+    c.call("compact")
+    assert c.wait("compact_end", start=m)["error"] is None
+    c.call("btw", {"question": "q", "id": "b"})
+    c.wait("btw_end", start=m)
+    assert [r.get("tool_choice") for r in api_log(api)] == ["none", "none"]
+
+
+def test_edit_refused_if_file_changed_during_approval(client):
+    c = client()
+    init(c)
+    f = c.ws / "race.txt"
+    f.write_text("a\n")
+
+    def approve(p):
+        f.write_text("a\nuser typed this\n")        # user saves the file while the card is open
+        return {"decision": "yes"}
+    c.approve = approve
+    _, end, m = c.send(mock({"tools": [{"name": "edit_file", "args": {"path": "race.txt", "old_string": "a", "new_string": "b"}}]},
+                            {"text": "k"}))
+    te = c.wait("tool_end", start=m)
+    assert te["error"] and "changed while waiting" in te["summary"]
+    assert f.read_text() == "a\nuser typed this\n"
+
+
+def test_transcript_mid_turn_includes_streaming_text_and_running_tools(client):
+    c = client()
+    init(c)
+    m = c.mark()
+    c.call("send", {"text": mock({"text": "streaming so far", "hang": 30})})
+    c.wait("text", start=m)
+    t = c.call("transcript")["transcript"]
+    assert t[-1] == {"type": "assistant", "text": "streaming so far", "streaming": True}
+    c.call("cancel")
+    c.wait("turn_end", start=m)
+    c.approve = lambda p: None
+    m = c.mark()
+    c.call("send", {"text": mock({"tools": [{"name": "bash", "args": {"command": "echo"}}]})})
+    c.wait("_request", start=m)
+    t = c.call("transcript")["transcript"]
+    assert t[-1]["type"] == "tool" and t[-1]["done"] is False
+    c.call("cancel")
+    c.wait("turn_end", start=m)
+
+
+def test_cancel_right_after_compact_is_not_lost(client):
+    c = client()
+    init(c)
+    c.send("x")
+    m = c.mark()
+    c.call("compact")
+    c.call("cancel")
+    e = c.wait("compact_end", start=m)
+    assert e["error"] == "cancelled" or e["error"] is None
+
+
+def test_cancel_during_slow_web_search(client):
+    c = client()
+    init(c)
+    m = c.mark()
+    c.call("send", {"text": mock({"tools": [{"name": "web_search", "args": {"query": "slow search"}}]}, {"text": "x"})})
+    c.wait("tool_start", start=m)
+    time.sleep(0.3)
+    t = time.time()
+    c.call("cancel")
+    end = c.wait("turn_end", start=m, timeout=5)
+    assert end["reason"] == "cancelled" and time.time() - t < 1.5
+    assert c.wait("tool_end", start=m)["summary"] == "Interrupted"
+    _, end, m = c.send("next")
+    assert end["reason"] == "done"

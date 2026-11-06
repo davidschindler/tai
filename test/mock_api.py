@@ -52,6 +52,22 @@ def script_step(messages):
     return {"text": f"Echo: {visible}"}, content
 
 
+def validate(messages):
+    """Every assistant tool call must be answered by tool messages right after it."""
+    for i, m in enumerate(messages):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            ids = {tc["id"] for tc in m["tool_calls"]}
+            j = i + 1
+            while j < len(messages) and messages[j].get("role") == "tool":
+                ids.discard(messages[j].get("tool_call_id"))
+                j += 1
+            if ids:
+                return f"tool_calls without results: {sorted(ids)}"
+        if m.get("role") == "tool" and (i == 0 or messages[i - 1].get("role") not in ("assistant", "tool")):
+            return "tool message without a preceding tool call"
+    return None
+
+
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -85,6 +101,8 @@ class H(BaseHTTPRequestHandler):
             return self._json({"error": {"message": "invalid api key"}}, 401)
         if self.path.endswith("/responses"):
             q = payload.get("input", "")
+            if "slow" in q.splitlines()[0]:
+                time.sleep(30)          # like a real search that takes a while
             return self._json({"output": [{"type": "message", "content": [{
                 "text": f"Search results for: {q.splitlines()[0]}",
                 "annotations": [{"url": "https://example.org/a", "title": "Example A"}]}]}]})
@@ -92,7 +110,12 @@ class H(BaseHTTPRequestHandler):
             return self._json({"error": {"message": "not found"}}, 404)
         with LOCK:
             LOG.append(payload)
+        problem = validate(payload.get("messages") or [])
+        if problem:     # like the real API: a broken conversation is rejected
+            return self._json({"error": {"message": problem}}, 400)
         step, _ = script_step(payload.get("messages") or [])
+        if payload.get("tool_choice") == "none":
+            step = {k: v for k, v in step.items() if k != "tools"}
         if step.get("delay"):
             time.sleep(step["delay"])
         if step.get("error"):

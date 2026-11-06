@@ -22,6 +22,7 @@ class Extension implements vscode.Disposable {
   sidebarView?: vscode.WebviewView;
   readonly panels = new Map<ChatController, vscode.WebviewPanel>();
   private lastFocused?: ChatController;
+  private focusOwner?: ChatController;
   private subs: vscode.Disposable[] = [];
   private sidebarAttached?: () => void;
 
@@ -34,8 +35,22 @@ class Extension implements vscode.Disposable {
       files: this.files,
       busyChanged: () => this.updateStatus(),
       focused: (c, f) => {
-        if (f) this.lastFocused = c;
-        vscode.commands.executeCommand("setContext", "taiChatFocused", f);
+        if (f) {
+          this.lastFocused = this.focusOwner = c;
+          vscode.commands.executeCommand("setContext", "taiChatFocused", true);
+        } else if (this.focusOwner === c) {      // ignore a late blur from a chat that lost focus earlier
+          this.focusOwner = undefined;
+          vscode.commands.executeCommand("setContext", "taiChatFocused", false);
+        }
+      },
+      revealSession: (c, id) => {
+        for (const other of [this.sidebar, ...this.panels.keys()]) {
+          if (!other || other === c || other.sessionId !== id) continue;
+          if (other === this.sidebar) this.showSidebar().then((s) => s.focusInput());
+          else this.panels.get(other)?.reveal(undefined, false);
+          return true;
+        }
+        return false;
       },
     };
     this.status.command = "tai.focus";
@@ -103,7 +118,10 @@ class Extension implements vscode.Disposable {
     panel.onDidDispose(() => {
       this.panels.delete(c);
       if (this.lastFocused === c) this.lastFocused = undefined;
-      vscode.commands.executeCommand("setContext", "taiChatFocused", false);
+      if (this.focusOwner === c) {
+        this.focusOwner = undefined;
+        vscode.commands.executeCommand("setContext", "taiChatFocused", false);
+      }
       c.dispose();
     });
     c.attach(panel.webview);

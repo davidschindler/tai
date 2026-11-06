@@ -20,6 +20,7 @@
 }
 body.vscode-light { --gold: #9a7800; }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; padding: 0; }
 body { background: var(--bg); color: var(--fg); font-family: var(--vscode-font-family); font-size: var(--vscode-font-size, 13px); line-height: 1.5; overflow: hidden; }
 #app { display: flex; flex-direction: column; height: 100vh; }
