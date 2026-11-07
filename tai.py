@@ -1649,9 +1649,9 @@ def run_tool(call, perms, compact=False):
         shown = f"{show_path(resolve(args['path']))}/{shown}"
     if not compact:
         say("")
-    paren = f"({clip(shown, 200)})" if shown else ""
     if name == SHELL_TOOL and args and args.get("run_in_background"):
-        paren += " · in the background"
+        label = "Background"            # first, so a long command can't push it off the line
+    paren = f"({clip(shown, 200)})" if shown else ""
     if RICH:
         say(Text.assemble(("● ", GOLD), (label, "bold"), (paren, "")), one_line=True)
     else:

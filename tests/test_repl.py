@@ -303,7 +303,7 @@ def test_background_job_in_a_live_session(term):
                                {"name": "todo_write", "args": {"todos": [
                                    {"content": "Start the job", "status": "completed"},
                                    {"content": "Wait for it", "status": "in_progress"}]}}]}, {"text": "k"}))
-    p.expect("· in the background")
+    p.expect("Background")                   # (capital B: not the typed run_in_background)
     p.expect("Started job b1")
     p.expect("◼ Wait for it")
     done(p)
