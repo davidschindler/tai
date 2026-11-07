@@ -1133,9 +1133,17 @@ def tool_edit_file(a, perms):
 
 def tool_bash(a, perms):
     cmd = a["command"]
+    bg = bool(a.get("run_in_background"))
     body = Text(cmd.strip(), style="bold") if RICH else cmd
-    perms.check("bash", "Run this command?", f"{SHELL_LABEL} command", body,
-                detail={"type": "bash", "command": cmd, "shell": SHELL_LABEL})
+    perms.check("bash", "Run this command in the background?" if bg else "Run this command?",
+                f"{SHELL_LABEL} command" + (" · background" if bg else ""), body,
+                detail={"type": "bash", "command": cmd, "shell": SHELL_LABEL, "background": bg})
+    if bg:
+        job = start_job(cmd)
+        return (f"Started in the background as job {job.id}. It keeps running while you continue; "
+                f"read its output with job_output (job_id \"{job.id}\", optionally wait=seconds), stop it "
+                "with job_stop. It is stopped when tai exits; you are told when it finishes.",
+                f"Started job {job.id} in the background")
     timeout = min(max(int(a.get("timeout") or 120), 1), 600)
     with working(f"Running {clip(cmd, 50)}…"):
         return _run_bash(cmd, timeout)
@@ -1165,13 +1173,19 @@ def kill_tree(proc):
         pass
 
 
-def _run_bash(cmd, timeout):
+def spawn_shell(cmd):
+    """Start cmd in tai's shell: output (stdout + stderr) on a pipe, own process group, no
+    secret environment variables, no console window."""
     env = {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
     extra = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW} if WINDOWS
              else {"start_new_session": True})
-    proc = subprocess.Popen(shell_argv(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    return subprocess.Popen(shell_argv(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
                             env=env, **extra)
+
+
+def _run_bash(cmd, timeout):
+    proc = spawn_shell(cmd)
     note, deadline = "", time.time() + timeout
     try:
         while True:
@@ -1197,6 +1211,207 @@ def _run_bash(cmd, timeout):
     if proc.returncode:
         preview += f"\n[exit code {proc.returncode}]"
     return f"{out}{note}\n[exit code {proc.returncode}]", preview + note
+
+
+# ================================================================ background jobs
+
+MAX_JOBS = 8                    # running at the same time
+JOB_KEEP = 1_000_000            # characters of output kept per job (the oldest are dropped)
+JOBS = {}                       # id -> Job, for this tai process
+JOBS_LOCK = threading.Lock()
+
+
+class Job:
+    """A command running in the background; its output is collected as it comes."""
+
+    def __init__(self, jid, cmd):
+        self.id, self.cmd, self.started, self.ended = jid, cmd, time.time(), None
+        self.out, self.base, self.seen = "", 0, 0     # base: characters dropped from the front
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.stopped = False
+        self.announced = False      # the model was told that it finished
+        self.proc = spawn_shell(cmd)
+        threading.Thread(target=self._read, daemon=True, name=f"job-{jid}").start()
+
+    def _read(self):
+        try:
+            for line in self.proc.stdout:
+                with self.lock:
+                    self.out += line
+                    if len(self.out) > JOB_KEEP:
+                        cut = len(self.out) - JOB_KEEP
+                        self.out, self.base = self.out[cut:], self.base + cut
+        except (OSError, ValueError):
+            pass
+        self.proc.wait()
+        self.ended = time.time()
+        self.done.set()
+        hook = IO_HOOKS.get("job_done")
+        if hook:
+            try:
+                hook(self)
+            except Exception:
+                pass
+
+    @property
+    def code(self):
+        return self.proc.returncode if self.done.is_set() else None
+
+    def state(self):
+        if not self.done.is_set():
+            return f"running for {human_secs(time.time() - self.started)}"
+        how = "stopped" if self.stopped else f"exit code {self.code}"
+        return f"finished ({how}) after {human_secs(self.ended - self.started)}"
+
+    def take(self):
+        """Output since the last take()."""
+        with self.lock:
+            start = max(self.seen, self.base)
+            text = self.out[start - self.base:]
+            lost = start - self.seen
+            self.seen = self.base + len(self.out)
+        return (f"[... {lost} older characters were dropped ...]\n" if lost else "") + text
+
+    def tail(self, n=1):
+        with self.lock:
+            lines = self.out.rstrip().splitlines()
+        return lines[-n:] if lines else []
+
+    def stop(self):
+        if not self.done.is_set():
+            self.stopped = True
+            kill_tree(self.proc)
+            self.done.wait(10)
+
+    def info(self):
+        return {"id": self.id, "command": self.cmd, "running": not self.done.is_set(), "code": self.code,
+                "stopped": self.stopped, "state": self.state(), "last": (self.tail() or [""])[0][:200]}
+
+
+def human_secs(t):
+    t = int(t)
+    return f"{t}s" if t < 60 else f"{t // 60}m {t % 60:02d}s" if t < 3600 else f"{t // 3600}h {t % 3600 // 60:02d}m"
+
+
+def start_job(cmd):
+    with JOBS_LOCK:
+        running = [j for j in JOBS.values() if not j.done.is_set()]
+        if len(running) >= MAX_JOBS:
+            raise ToolError(f"{MAX_JOBS} background jobs are already running; stop one with job_stop first")
+        jid = f"b{len(JOBS) + 1}"
+        try:
+            job = JOBS[jid] = Job(jid, cmd)
+        except OSError as e:
+            raise ToolError(f"cannot start the command: {e}")
+    return job
+
+
+def find_job(jid):
+    job = JOBS.get(str(jid or "").strip())
+    if not job:
+        known = ", ".join(JOBS) or "none"
+        raise ToolError(f"no background job {jid!r} (jobs: {known})")
+    return job
+
+
+def tool_job_output(a, perms):
+    job = find_job(a.get("job_id"))
+    wait = min(max(int(a.get("wait") or 0), 0), 600)
+    if wait:
+        end = time.time() + wait
+        with working(f"Waiting for job {job.id}…"):
+            while not job.done.wait(0.2) and time.time() < end:
+                if CANCEL.is_set():
+                    break
+    out = job.take()
+    if job.done.is_set():
+        job.announced = True
+    text = out.rstrip() or "(no new output)"
+    if len(text) > MAX_TOOL_OUTPUT:
+        text = f"[... {len(text) - MAX_TOOL_OUTPUT} characters left out ...]\n" + text[-MAX_TOOL_OUTPUT:]
+    lines = out.rstrip().splitlines()
+    return (f"{text}\n[job {job.id}: {job.state()}]",
+            f"{len(lines)} new line{'s' if len(lines) != 1 else ''} · {job.state()}")
+
+
+def tool_job_stop(a, perms):
+    job = find_job(a.get("job_id"))
+    was = not job.done.is_set()
+    job.stop()
+    job.announced = True
+    out = job.take().rstrip()
+    return ((f"{out[-5000:]}\n" if out else "") + f"[job {job.id}: {job.state()}]",
+            f"Stopped job {job.id}" if was else f"Job {job.id} had already {job.state()}")
+
+
+def stop_all_jobs():
+    for job in list(JOBS.values()):
+        job.stop()
+
+
+def finished_jobs_note():
+    """A note for the model about background jobs that finished since it last looked."""
+    done = [j for j in JOBS.values() if j.done.is_set() and not j.announced]
+    for j in done:
+        j.announced = True
+    if not done:
+        return None
+    return "[Background " + "; ".join(f"job {j.id} ({clip(j.cmd, 80)}) {j.state()}" for j in done) + \
+        ". job_output shows what it printed.]"
+
+
+def jobs_command(arg):
+    """/jobs, /jobs stop ID (terminal)."""
+    words = arg.split()
+    if words[:1] == ["stop"] and len(words) == 2:
+        try:
+            find_job(words[1]).stop()
+        except ToolError as e:
+            err(str(e))
+            return
+    elif words:
+        err("usage: /jobs  or  /jobs stop ID")
+        return
+    if not JOBS:
+        dim("no background jobs (tai starts one when a command should keep running, like a server)")
+        return
+    for j in JOBS.values():
+        last = j.tail()
+        dim(f"  {j.id}  {clip(j.cmd, 60)}  · {j.state()}" + (f"\n        {clip(last[0], 90)}" if last else ""))
+    if any(not j.done.is_set() for j in JOBS.values()):
+        dim("  /jobs stop ID stops one; all are stopped when tai exits")
+
+
+# ================================================================ task list
+
+TODO_STATUS = ("pending", "in_progress", "completed")
+TODO_MARK = {"pending": "☐", "in_progress": "◼", "completed": "☒"}
+
+
+def todo_text(items):
+    return "\n".join(f"{TODO_MARK[i['status']]} {i['content']}" for i in items)
+
+
+def tool_todo_write(a, perms):
+    items = a.get("todos")
+    if not isinstance(items, list):
+        raise ToolError("todos must be a list of {content, status}")
+    clean = []
+    for it in items[:50]:
+        if not isinstance(it, dict) or not str(it.get("content") or "").strip():
+            raise ToolError("every item needs a content text and a status")
+        if it.get("status") not in TODO_STATUS:
+            raise ToolError(f"status must be one of {', '.join(TODO_STATUS)}")
+        clean.append({"content": clip(" ".join(str(it["content"]).split()), 200), "status": it["status"]})
+    hook = IO_HOOKS.get("todos")
+    if hook:
+        hook(clean)
+    done = sum(i["status"] == "completed" for i in clean)
+    note = ("" if done == len(clean) else
+            " Keep it up to date: mark an item in_progress when you start it and completed as soon as it is done.")
+    return (f"Task list saved ({done} of {len(clean)} done).{note}\n{todo_text(clean)}",
+            todo_text(clean) or "(empty task list)")
 
 
 # ================================================================ web tools
@@ -1367,8 +1582,22 @@ TOOLS = [
     fn(SHELL_TOOL, f"Run a {SHELL_LABEL} command in the current directory; returns combined "
        "stdout/stderr and the exit code. Requires user approval. Non-interactive: never run commands "
        "that wait for input.",
-       {"command": S, "timeout": {"type": "integer", "description": "seconds, default 120, max 600"}},
+       {"command": S, "timeout": {"type": "integer", "description": "seconds, default 120, max 600"},
+        "run_in_background": {"type": "boolean", "description":
+            "start it and return at once, for servers, watchers and long jobs; read its output "
+            "later with job_output"}},
        ["command"]),
+    fn("job_output", "Read the new output of a background job (started with run_in_background) and "
+       "whether it is still running. wait: seconds to wait for the job to finish first (max 600).",
+       {"job_id": S, "wait": {"type": "integer", "description": "seconds, default 0"}}, ["job_id"]),
+    fn("job_stop", "Stop a background job (and the processes it started).", {"job_id": S}, ["job_id"]),
+    fn("todo_write", "Your task list for work with several steps (3 or more), shown to the user. Send "
+       "the WHOLE list each time. Mark exactly one item in_progress while you work on it and mark it "
+       "completed as soon as it is done; add items you discover. Skip it for quick, simple requests.",
+       {"todos": {"type": "array", "items": {"type": "object", "properties": {
+           "content": {"type": "string", "description": "the step, in a few words"},
+           "status": {"type": "string", "enum": list(TODO_STATUS)}}, "required": ["content", "status"]}}},
+       ["todos"]),
     fn("web_search", "Search the web. Returns a summary of findings with source URLs. Use for current "
        "information, facts you are unsure about, papers, documentation. One focused query per call; "
        "several calls in one reply run back to back.",
@@ -1388,14 +1617,16 @@ TOOLS = [
         "model": {"type": "string", "description": "optional model id; default: your own model"}},
        ["description", "prompt"]),
 ]
-SUB_TOOLS = [t for t in TOOLS if t["function"]["name"] != "task"]
+SUB_TOOLS = [t for t in TOOLS if t["function"]["name"] not in ("task", "todo_write")]
 RUNNERS = {"read_file": tool_read_file, "list_files": tool_list_files, "grep": tool_grep,
            "write_file": tool_write_file, "edit_file": tool_edit_file, SHELL_TOOL: tool_bash,
-           "web_search": tool_web_search, "web_fetch": tool_web_fetch}
+           "web_search": tool_web_search, "web_fetch": tool_web_fetch, "job_output": tool_job_output,
+           "job_stop": tool_job_stop, "todo_write": tool_todo_write}
 LABELS = {"read_file": ("Read", "path"), "list_files": ("List", "pattern"), "grep": ("Grep", "pattern"),
           "write_file": ("Write", "path"), "edit_file": ("Edit", "path"),
           SHELL_TOOL: (SHELL_LABEL, "command"),
-          "web_search": ("WebSearch", "query"), "web_fetch": ("Fetch", "url")}
+          "web_search": ("WebSearch", "query"), "web_fetch": ("Fetch", "url"),
+          "job_output": ("JobOutput", "job_id"), "job_stop": ("JobStop", "job_id"), "todo_write": ("Tasks", None)}
 
 
 def parse_args(call):
@@ -1418,10 +1649,13 @@ def run_tool(call, perms, compact=False):
         shown = f"{show_path(resolve(args['path']))}/{shown}"
     if not compact:
         say("")
+    paren = f"({clip(shown, 200)})" if shown else ""
+    if name == SHELL_TOOL and args and args.get("run_in_background"):
+        paren += " · in the background"
     if RICH:
-        say(Text.assemble(("● ", GOLD), (label, "bold"), (f"({clip(shown, 200)})", "")), one_line=True)
+        say(Text.assemble(("● ", GOLD), (label, "bold"), (paren, "")), one_line=True)
     else:
-        say(f"● {label}({clip(shown, 200)})")
+        say(f"● {label}{paren}")
 
     return exec_tool(call, perms)
 
@@ -1625,7 +1859,12 @@ def system_prompt(use_tools, extra=None, sub=False, ide=False):
             "an action, don't retry it; follow their instructions or ask.\n"
             "- Never run destructive or irreversible commands (deleting files, git reset --hard, "
             "overwriting data, sending data to remote services) unless the user explicitly asked.\n"
-            "- Commands run non-interactively with a timeout; don't start editors, pagers or servers.\n"
+            "- Commands run non-interactively with a timeout; don't start editors or pagers. For servers, "
+            "watchers and long builds or analyses, set run_in_background and check on them with "
+            "job_output; stop them with job_stop when they are no longer needed.\n"
+            + ("" if sub else
+               "- For a task with several steps, keep a task list with todo_write and update it as you go.\n")
+            +
             "- When done, say briefly what you did. Be concise; use markdown.")
     else:
         parts.append("Be concise; use markdown.")
@@ -1847,6 +2086,9 @@ def run_turn(conv, perms, markdown, use_tools):
             msgs.append({"role": "tool", "tool_call_id": c["id"], "content": r})
         if CANCEL.is_set():
             return
+        note = finished_jobs_note()
+        if note:
+            msgs.append({"role": "user", "content": note})
         queued = take_inbox()
         if queued:
             msgs.append({"role": "user", "content": "\n\n".join(queued)})
@@ -1916,6 +2158,7 @@ HELP = """Commands:
                   when the context window is 80% full)
   /rewind [N]     go back to an earlier message and undo tai's file changes since then
   /permissions    show the saved permission rules and where they are stored
+  /jobs           commands running in the background; /jobs stop ID stops one
   /help           this help                   /exit     quit (or Ctrl+C twice, or Ctrl+D)
 Alt+Enter inserts a new line (pasting multi-line text also works).
 Shift+Tab cycles the permission mode (manual → accept-edits → auto).
@@ -1960,6 +2203,9 @@ def ask(conv, perms, markdown, content):
     user = {"role": "user", "content": content}
     if compact_due(msgs + [user]) and compact_conv(conv, auto=True) == "cancelled":
         return False
+    note = finished_jobs_note()
+    if note:
+        msgs.append({"role": "user", "content": note})
     msgs.append(user)
     start_checkpoint(conv, len(msgs) - 1)
     print()
@@ -2006,7 +2252,8 @@ def rewind_files(turns, msg_index):
 def is_note(m):
     """Messages tai wrote itself (compaction summary, 'continue' note), not the user's."""
     c = m.get("content")
-    return isinstance(c, str) and (c.startswith("[Summary of the earlier conversation]") or c == CONTINUE_NOTE)
+    return isinstance(c, str) and (c.startswith(("[Summary of the earlier conversation]", "[Background job"))
+                                   or c == CONTINUE_NOTE)
 
 
 def visible_text(content):
@@ -2117,7 +2364,7 @@ def compact_conv(conv, instructions="", midway=False, auto=False):
     except RuntimeError as e:
         err(f"tai: compacting failed: {e}")
         return "failed"
-    msgs[:] = compacted_messages(msgs[0], summary, midway)
+    msgs[:] = compacted_messages(msgs[0], summary, midway, conv.get("todos"))
     conv["turns"] = []
     with CHECKPOINT_LOCK:
         CHECKPOINT["turn"] = None
@@ -2160,6 +2407,7 @@ COMMANDS = [("/help", "show commands"), ("/model", "show or switch model"), ("/m
             ("/compact", "summarize the conversation to free up context"),
             ("/rewind", "go back to an earlier message (and undo file changes)"),
             ("/permissions", "show saved permission rules"),
+            ("/jobs", "background commands (/jobs stop ID)"),
             ("/exit", "quit")]
 
 
@@ -2337,7 +2585,7 @@ def stop_turn():
 
 
 # commands that make sense while tai is working (others change what the turn is working on)
-BUSY_OK = {"/btw", "/mode", "/usage", "/help", "/model", "/models", "/file", "/save", "/permissions",
+BUSY_OK = {"/btw", "/mode", "/usage", "/help", "/model", "/models", "/file", "/save", "/permissions", "/jobs",
            "/exit", "/quit", "/q"}
 
 
@@ -2487,6 +2735,8 @@ def _repl_line(text, conv, perms, markdown, pending, start):
             start(job=lambda: compact_conv(conv, arg))
         elif cmd == "/rewind":
             rewind(conv, arg)
+        elif cmd == "/jobs":
+            jobs_command(arg)
         elif cmd == "/permissions":
             lines = SETTINGS.describe()
             dim(f"mode: {perms.mode} — {MODE_INFO[perms.mode]}")
@@ -2736,6 +2986,8 @@ def describe_call(name, args):
     shown = args.get(key, "") if (args and key) else ""
     if not isinstance(shown, str):
         shown = str(shown)
+    if name == SHELL_TOOL and args and args.get("run_in_background"):
+        label += " (background)"
     try:
         if key == "path" and shown:
             shown = show_path(resolve(shown))
@@ -2842,7 +3094,9 @@ def summarize(reply, msgs, instructions="", midway=False):
         return text.strip()
 
 
-def compacted_messages(system, summary, midway):
+def compacted_messages(system, summary, midway, todos=None):
+    if todos and any(t["status"] != "completed" for t in todos):
+        summary += "\n\nYour task list (todo_write) at this point:\n" + todo_text(todos)
     out = [system, {"role": "user", "content": "[Summary of the earlier conversation]\n\n" + summary},
            {"role": "assistant", "content": "Understood. I'll continue from this summary."}]
     if midway:
@@ -2954,6 +3208,8 @@ class Server:
         self.new_session(model, True, None)
         IO_HOOKS["before_write"] = self._before_write
         IO_HOOKS["after_write"] = self._after_write
+        IO_HOOKS["todos"] = self._todos
+        IO_HOOKS["job_done"] = lambda j: self.proto.event("job_done", job=j.info())
 
     # ------------------------------------------------------------ session state
     @property
@@ -3008,7 +3264,8 @@ class Server:
     def state(self):
         return {"session": self.meta(), "model": self.conv["model"], "mode": self.perms.mode,
                 "tools": self.conv["tools"], "system": self.conv.get("extra_system") or "",
-                "busy": self.busy, "usage": self.usage()}
+                "busy": self.busy, "usage": self.usage(), "todos": self.conv.get("todos") or [],
+                "jobs": [j.info() for j in JOBS.values()]}
 
     def usage(self):
         return {"input": USAGE.inp, "output": USAGE.out, "ctx": USAGE.ctx, "maxCtx": USAGE.max_ctx}
@@ -3022,6 +3279,17 @@ class Server:
             turn = self.cur_turn
             if turn is not None and str(path) not in turn["files"]:
                 turn["files"][str(path)] = snapshot(path)
+
+    def _todos(self, items):
+        self.conv["todos"] = items
+        self.proto.event("todos", items=items)
+
+    def add_note(self, text):
+        """A message for the model that the user doesn't see as theirs (e.g. a job finished)."""
+        with self.lock:
+            msgs = self.conv["messages"]
+            msgs.append({"role": "user", "content": text})
+            self.conv.setdefault("display", {})[str(len(msgs) - 1)] = {"kind": "hidden"}
 
     def _after_write(self, path, old, new):
         _tls.last_write = (path, old, new)
@@ -3250,6 +3518,9 @@ class Server:
                 result, summary, style = exec_tool(call, self.perms, self.runners())
         except Exception as e:      # a tool must never take the session down
             result, summary, style = f"Error: {e}", f"Error: {e}", "red"
+        if call["name"] == "todo_write" and style != "red":
+            m = re.search(r"\d+ of \d+ done", result)
+            summary = m.group(0) if m else summary        # the list itself is in the panel
         diff = None
         lw = getattr(_tls, "last_write", None)
         if lw and style != "red":
@@ -3389,6 +3660,9 @@ class Server:
 
     def turn(self, content, display, client_id):
         msgs = self.conv["messages"]
+        note = finished_jobs_note()
+        if note:
+            self.add_note(note)
         idx = self.add_user(content, display, client_id)
         self.proto.event("turn_start", index=idx)
         replied, reason, error = False, "done", None
@@ -3452,6 +3726,10 @@ class Server:
                             msgs.append({"role": "tool", "tool_call_id": c["id"], "content": r})
                     if CANCEL.is_set():
                         raise Cancelled()
+                if calls:
+                    note = finished_jobs_note()
+                    if note:
+                        self.add_note(note)
                 injected = self.drain_inbox()
                 if not calls and not injected:
                     break
@@ -3550,7 +3828,7 @@ class Server:
             raise Cancelled() from None         # the partial summary is not a reply
         with self.lock:
             msgs = self.conv["messages"]
-            msgs[:] = compacted_messages(msgs[0], summary, midway)
+            msgs[:] = compacted_messages(msgs[0], summary, midway, self.conv.get("todos"))
             self.conv["display"] = {"1": {"text": summary, "kind": "summary", "time": time.time()}}
             if midway:
                 self.conv["display"]["3"] = {"kind": "hidden"}
@@ -3644,6 +3922,16 @@ class Server:
             CANCEL.clear()
         threading.Thread(target=self.compact, args=(str(p.get("instructions") or ""),), daemon=True).start()
         return {}
+
+    def m_jobs(self, p):
+        return {"jobs": [j.info() for j in JOBS.values()]}
+
+    def m_job_stop(self, p):
+        job = JOBS.get(str(p.get("id") or ""))
+        if not job:
+            raise ValueError(f"no background job {p.get('id')}")
+        job.stop()
+        return job.info()
 
     def m_permissions(self, p):
         """The settings file with the saved rules (created if missing), for the editor to open."""
@@ -3849,6 +4137,7 @@ def serve(args):
         server.cancel()
         if server.worker:
             server.worker.join(timeout=5)
+    stop_all_jobs()
     os._exit(0)
 
 
@@ -3892,6 +4181,9 @@ def main():
         return
 
     IO_HOOKS["before_write"] = checkpoint_write      # for /rewind
+    IO_HOOKS["job_done"] = lambda j: dim(f"  ⎿  background job {j.id} {j.state()}: {clip(j.cmd, 60)}")
+    import atexit
+    atexit.register(stop_all_jobs)
     conv = None
     if args.resume:
         try:
@@ -3919,6 +4211,7 @@ def main():
             conv["extra_system"] = args.system
         reset_system(conv)
     perms = Permissions("auto" if args.auto else "accept-edits" if args.auto_edit else "manual")
+    IO_HOOKS["todos"] = lambda items: conv.__setitem__("todos", items)
 
     try:
         attachments = [read_file_block(f) for f in args.file]

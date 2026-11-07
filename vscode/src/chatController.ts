@@ -852,6 +852,17 @@ export class ChatController implements vscode.Disposable {
         return this.openTerminal();
       case "restart":
         return this.restart();
+      case "jobs": {
+        const words = arg.split(/\s+/).filter(Boolean);
+        if (words[0] === "stop" && words[1]) {
+          const j = await c.call("job_stop", { id: words[1] }, 20000);
+          return this.notice("info", `Job ${j.id} ${j.state}`);
+        }
+        const r = await c.call("jobs", {}, 10000);
+        if (!r.jobs.length) return this.notice("info", "No background jobs. tai starts one when a command should keep running, such as a server.");
+        return this.notice("info", r.jobs.map((j: any) => `${j.id} · ${j.command} · ${j.state}${j.last ? ` · ${j.last}` : ""}`).join("  |  ") +
+          (r.jobs.some((j: any) => j.running) ? "   (/jobs stop ID stops one; all stop when tai stops)" : ""));
+      }
       case "permissions": {
         const r = await c.call("permissions", {}, 10000);
         await vscode.window.showTextDocument(vscode.Uri.file(r.path), { preview: false });

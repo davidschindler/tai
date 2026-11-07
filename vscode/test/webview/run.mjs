@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, afterEach, before, describe, it } from "node:test";
-import { Harness, launch, mock, startMock } from "./harness.mjs";
+import { Harness, PYTHON, launch, mock, startMock } from "./harness.mjs";
 
 const SHOTS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "screenshots");
 const SHELL = process.platform === "win32" ? "powershell" : "bash";    // tai's shell tool on this OS
@@ -336,6 +336,28 @@ describe("webview", { concurrency: false }, () => {
     await h.sendText("after");
     await h.waitIdle();
     assert.deepEqual(await h.page.$$eval(".msg.user[data-index]", (b) => b.map((x) => x.dataset.index)), ["5"]);
+    await done(h);
+  });
+
+  it("shows the task list above the input and a notice when a background job ends", async () => {
+    const h = await harness({ mode: "auto" });
+    const todos = (st) => [{ content: "Read the data", status: "completed" },
+      { content: "Clean the columns", status: st }, { content: "Run the models", status: st === "completed" ? "completed" : "pending" }];
+    const py = JSON.stringify(PYTHON);
+    const cmd = process.platform === "win32" ? `& ${py} -c "print('bg done')"` : `${py} -c "print('bg done')"`;
+    await h.sendText(mock({ tools: [{ name: "todo_write", args: { todos: todos("in_progress") } },
+      { name: SHELL, args: { command: cmd, run_in_background: true } }] }, { text: "working" }));
+    await h.waitSel("#todos:not([hidden])");
+    assert.deepEqual(await h.text("#todos .todos-head"), ["Tasks · 1 of 3 done"]);
+    assert.deepEqual(await h.text("#todos li.in-progress .text"), ["Clean the columns"]);
+    assert.deepEqual(await h.text("#todos li.completed .text"), ["Read the data"]);
+    await h.page.waitForFunction(() => [...document.querySelectorAll(".notice")]
+      .some((n) => /Background job b1 finished \(exit code 0\)/.test(n.textContent)), { timeout: 15000 });
+    await h.waitIdle();
+    await h.shot(SHOTS, "12-tasks");
+    await h.sendText(mock({ tools: [{ name: "todo_write", args: { todos: todos("completed") } }] }, { text: "done" }));
+    await h.waitIdle();
+    await h.page.waitForFunction(() => document.getElementById("todos").hidden);     // all done: hidden
     await done(h);
   });
 

@@ -58,6 +58,7 @@ const LOGO_DARK = app.dataset.logoDark ?? LOGO;
 app.innerHTML = `
   <div id="banner" hidden></div>
   <div id="scroller"><div id="messages"></div><div id="thinking" hidden></div></div>
+  <div id="todos" hidden></div>
   <div id="approvals"></div>
   <div id="composer">
     <div id="menu" hidden role="listbox"></div>
@@ -75,6 +76,7 @@ app.innerHTML = `
   <div id="toast" hidden></div>`;
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const banner = $("banner"), scroller = $("scroller"), messages = $("messages"), thinking = $("thinking");
+const todosEl = $("todos");
 const approvalsEl = $("approvals"), menu = $("menu"), chips = $("chips"), usageEl = $("usage");
 const input = $<HTMLTextAreaElement>("input"), modeBtn = $("modeBtn"), modelBtn = $("modelBtn"), sendBtn = $<HTMLButtonElement>("sendBtn");
 const mentionBtn = $("mentionBtn");
@@ -558,6 +560,7 @@ const COMMANDS: [string, string][] = [
   ["/history", "open an earlier conversation"],
   ["/rewind", "go back to an earlier message"],
   ["/permissions", "show and edit the saved permission rules"],
+  ["/jobs", "commands running in the background (/jobs stop ID)"],
   ["/tools", "toggle agent tools on/off (plain chat)"],
   ["/system", "set extra instructions for this conversation"],
   ["/usage", "token usage this session"],
@@ -594,7 +597,25 @@ function updatePlaceholder() {
   input.placeholder = S.busy ? "Queue another message…" : "Ask tai… (@ to mention files, / for commands)";
 }
 
+// the task list tai keeps (todo_write): shown above the composer while it has open items
+function renderTodos() {
+  const items = S.state?.todos ?? [];
+  const done = items.filter((t) => t.status === "completed").length;
+  todosEl.hidden = !items.length || done === items.length;
+  if (todosEl.hidden) return;
+  const head = el("div", "todos-head", `Tasks · ${done} of ${items.length} done`);
+  const list = el("ul");
+  for (const t of items) {
+    const li = el("li", t.status.replace("_", "-"));
+    li.append(el("span", "mark", t.status === "completed" ? "☒" : t.status === "in_progress" ? "◼" : "☐"),
+      el("span", "text", t.content));
+    list.append(li);
+  }
+  todosEl.replaceChildren(head, list);
+}
+
 function updateToolbar() {
+  renderTodos();
   const st = S.state;
   const mode: Mode = st?.mode ?? "manual";
   const label = { manual: "⏸ manual", "accept-edits": "⏵ accept edits", auto: "⏵⏵ auto" }[mode];
@@ -702,7 +723,7 @@ function runCommand(cmd: string, arg: string, _rest: string[]): boolean {
       send({ type: "pickModel" });
       return true;
     case "model": case "tools": case "system": case "compact": case "usage": case "save":
-    case "history": case "resume": case "terminal": case "restart": case "rewind": case "permissions":
+    case "history": case "resume": case "terminal": case "restart": case "rewind": case "permissions": case "jobs":
       if (cmd === "compact" && !S.busy) {
         S.compacting = true;
         S.turnStart = Date.now();
@@ -1051,6 +1072,15 @@ function onEvent(e: TaiEvent) {
       else if (!b.text.trim()) b.body.replaceChildren(el("span", "dim", "(no answer)"));
       else renderMarkdown(b.body, b.text, hooks, true);
       btws.delete(e.id);
+      break;
+    }
+    case "todos":
+      if (S.state) S.state.todos = e.items;
+      renderTodos();
+      break;
+    case "job_done": {
+      const j = e.job;
+      addNotice(j.stopped || j.code === 0 ? "info" : "warning", `Background job ${j.id} ${j.state}: ${j.command}`);
       break;
     }
     case "auto_compact":

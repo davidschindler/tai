@@ -468,6 +468,12 @@ describe("tai extension", function () {
     assert.strictEqual(ext.sidebar.busy, false);
   });
 
+  it("/jobs lists background jobs", async () => {
+    const m = probe.mark();
+    await probe.webview({ type: "command", name: "jobs", arg: "" });
+    assert.match((await until(() => probe.since(m, "notice")[0], 5000, "notice")).text, /No background jobs/);
+  });
+
   it("/permissions opens the settings file with the saved rules", async () => {
     const m = probe.mark();
     await probe.webview({ type: "command", name: "permissions", arg: "" });

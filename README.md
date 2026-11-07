@@ -55,6 +55,8 @@ tai
 - `@file` attaches a file, `/` lists commands (`/btw` for a side question, `/model`, `/compact`, `/rewind`, `/permissions`, …), `Esc` stops tai (`Ctrl+C` in the terminal).
 - **While tai works** you can keep typing: `/btw QUESTION` is answered right away without disturbing the task, and a normal message is read at tai's next step.
 - **Long conversations:** when the context window is 80% full, tai summarizes the conversation so far and carries on, also in the middle of a task (`/compact` does it on request; set `TAI_AUTO_COMPACT=0` to turn the automatic one off).
+- **Task list:** for work with several steps tai keeps a checklist, shown above the input in VS Code and as `☒ ◼ ☐` in the terminal.
+- **Background commands:** servers, watchers and long runs can keep going while tai works on; tai reads their output when it needs it and is told when they finish. `/jobs` lists them, `/jobs stop ID` stops one, and all of them stop when tai does.
 - **Going back:** `/rewind` returns to one of your earlier messages and undoes the file changes tai made since then; the message comes back in the input to edit and resend.
 - Commands run in **bash** on macOS/Linux and in **PowerShell** on Windows.
 - Conversations are saved locally (`%LOCALAPPDATA%\tai` on Windows, `~/.local/state/tai` elsewhere). `tai -c` continues the last one.

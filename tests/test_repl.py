@@ -294,3 +294,24 @@ def test_auto_compact_in_a_live_session(term):
     done(p)
     p.sendline("/exit")
     p.expect(pexpect.EOF)
+
+
+def test_background_job_in_a_live_session(term):
+    p = term("--auto")
+    cmd = f"'{sys.executable}' -c \"import time; time.sleep(5); print('job says hi')\""
+    p.sendline(mock({"tools": [{"name": SHELL, "args": {"command": cmd, "run_in_background": True}},
+                               {"name": "todo_write", "args": {"todos": [
+                                   {"content": "Start the job", "status": "completed"},
+                                   {"content": "Wait for it", "status": "in_progress"}]}}]}, {"text": "k"}))
+    p.expect("· in the background")
+    p.expect("Started job b1")
+    p.expect("◼ Wait for it")
+    done(p)
+    p.sendline("/jobs")
+    p.expect("running for")
+    p.expect("background job b1 finished \\(exit code 0\\)", timeout=10)
+    p.sendline("/jobs")
+    p.expect("finished \\(exit code 0\\)")
+    p.expect("job says hi")                  # the last line it printed
+    p.sendline("/exit")
+    p.expect(pexpect.EOF)

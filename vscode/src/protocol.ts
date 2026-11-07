@@ -29,7 +29,13 @@ export interface TaiState {
   system: string;
   busy: boolean;
   usage: Usage;
+  todos?: TodoItem[];
+  jobs?: JobInfo[];
 }
+
+export interface TodoItem { content: string; status: "pending" | "in_progress" | "completed" }
+export interface JobInfo { id: string; command: string; running: boolean; code: number | null;
+  stopped: boolean; state: string; last: string }
 
 export interface FileDiff {
   path: string;
@@ -69,6 +75,8 @@ export type TaiEvent =
   | { type: "btw_text"; id: string; delta: string }
   | { type: "btw_end"; id: string; error: string | null }
   | { type: "compact_end"; error: string | null; transcript: TranscriptItem[] | null; usage: Usage }
+  | { type: "todos"; items: TodoItem[] }
+  | { type: "job_done"; job: JobInfo }
   | { type: "auto_compact"; phase: "start" } | { type: "auto_compact"; phase: "end"; error: string | null;
       before: number; after: number | null; usage: Usage };
 

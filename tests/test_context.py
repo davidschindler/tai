@@ -3,11 +3,20 @@ the limit, or when the API refuses a request as too long), in VS Code and in the
 
 The mock model "mock-window" has a 3000-token window (characters / 4) and refuses anything
 larger; tai compacts at 80% of it."""
+import json
 import os
 import subprocess
 import sys
 
 from conftest import TAI, api_log, mock, reset_log
+
+def tai_system_prompt():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tai_ctx", TAI)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.system_prompt(True, ide=True)
+
 
 PAD = "lorem ipsum dolor sit amet\n" * 310     # 8370 characters ≈ 2100 tokens
 
@@ -72,7 +81,10 @@ def test_compacts_in_the_middle_of_a_task(client, api):
 def test_summary_request_is_cut_down_when_it_is_too_long(client, api):
     c = client()
     init(c)
-    c.send("lorem ipsum dolor sit amet\n" * 345 + mock({"text": "ONE"}))   # just under the limit
+    # fill the window to just under its limit (the system prompt's size changes as tai grows)
+    lines = (2960 * 4 - len(json.dumps(tai_system_prompt())) - 300) // 28
+    _, end, _ = c.send("lorem ipsum dolor sit amet\n" * lines + mock({"text": "ONE"}))
+    assert end["reason"] == "done", end
     reset_log(api)
     _, end, _ = c.send(mock({"text": "TWO"}))
     assert end["reason"] == "done", end

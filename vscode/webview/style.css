@@ -146,6 +146,18 @@ pre.cmd { font-weight: 600; }
 #thinking .spin { color: var(--gold); width: 1em; text-align: center; }
 #thinking .verb { color: var(--gold); font-weight: 600; }
 
+/* task list */
+#todos { margin: 0 12px 6px; padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--panel); max-height: 30vh; overflow-y: auto; flex: none; font-size: .95em; }
+#todos[hidden] { display: none; }
+#todos .todos-head { color: var(--gold); font-weight: 600; margin-bottom: 2px; }
+#todos ul { list-style: none; margin: 0; padding: 0; }
+#todos li { display: flex; gap: 6px; padding: 1px 0; }
+#todos li .mark { flex: none; width: 1.1em; }
+#todos li.in-progress { font-weight: 600; }
+#todos li.in-progress .mark { color: var(--gold); }
+#todos li.completed { opacity: .6; text-decoration: line-through; }
+
 /* approvals */
 #approvals { display: flex; flex-direction: column; gap: 8px; padding: 0 12px; max-height: 60vh; overflow-y: auto; flex: none; }
 #approvals:empty { display: none; }
