@@ -304,9 +304,14 @@ describe("tai extension", function () {
     await probe.send(mock({ tools: [{ name: "edit_file", args: { path: "rewind.txt", old_string: "v0", new_string: "v1" } }] }, { text: "edited" }));
     assert.strictEqual(fs.readFileSync(f, "utf8"), "v1\n");
     const idx = (probe.since(m, "user")[0] as any).index;
-    const p = ext.sidebar.rewind(idx);
-    await sleep(800);
-    await vscode.commands.executeCommand("workbench.action.acceptSelectedQuickOpenItem");   // "Restore code and conversation"
+    let settled = false;
+    const p = ext.sidebar.rewind(idx).finally(() => { settled = true; });
+    // accept "Restore code and conversation" once the quick pick is up (slow runners take a while to show it)
+    await until(async () => {
+      await vscode.commands.executeCommand("workbench.action.acceptSelectedQuickOpenItem");
+      await sleep(300);
+      return settled;
+    }, 15000, "rewind quick pick");
     await p;
     assert.strictEqual(fs.readFileSync(f, "utf8"), "v0\n");
     const t = [...probe.posted].reverse().find((x) => x.type === "transcript") as any;
