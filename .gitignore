@@ -9,3 +9,4 @@ vscode/tai/
 vscode/LICENSE
 __pycache__/
 .pytest_cache/
+tests/.sbx-*/

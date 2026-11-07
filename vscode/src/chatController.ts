@@ -442,7 +442,7 @@ export class ChatController implements vscode.Disposable {
       case "ready":
         return this.onReady();
       case "send":
-        return this.send(m.text, m.clientId, m.includeContext);
+        return this.send(m.text, m.clientId, m.includeContext, m.images, m.command, m.arg);
       case "cancel":
         return this.cancel();
       case "approve":
@@ -503,17 +503,19 @@ export class ChatController implements vscode.Disposable {
     }
   }
 
-  private async send(text: string, clientId: string, includeContext: boolean) {
+  private async send(text: string, clientId: string, includeContext: boolean,
+    images?: { name: string; data: string }[], command?: string, arg?: string) {
     if (!(await this.ensureStarted())) {
       this.post({ type: "event", event: { type: "turn_end", reason: "error", error: "tai is not running",
         removedUser: null, unsent: [text], stats: { input: 0, output: 0, seconds: 0, model: "" },
         usage: this.state?.usage ?? { input: 0, output: 0, ctx: 0, maxCtx: null } } });
       return;
     }
-    const attachments = parseMentions(text, this.cwd);
+    const attachments = parseMentions(command ? arg ?? "" : text, this.cwd);
     const context = includeContext && settings().attachOpenFile ? this.shared.tracker.context(this.cwd) : null;
     try {
-      await this.client!.call("send", { text, clientId, attachments, context }, 30000);
+      await this.client!.call("send", { text, clientId, attachments, context,
+        ...(images?.length ? { images } : {}), ...(command ? { command, arg: arg ?? "" } : {}) }, 30000);
     } catch (e: any) {
       this.post({ type: "event", event: { type: "turn_end", reason: "error", error: e.message,
         removedUser: null, unsent: [text], stats: { input: 0, output: 0, seconds: 0, model: "" },
@@ -868,7 +870,7 @@ export class ChatController implements vscode.Disposable {
         await vscode.window.showTextDocument(vscode.Uri.file(r.path), { preview: false });
         return this.notice("info", (r.rules.length ? "Saved rules: " + r.rules.map((x: string) => x.trim()).join("; ") + "." : "No saved rules yet.") +
           " Answering “don't ask again” to a command or site adds one; edit the file to add or remove rules " +
-          "(`deny` rules block even in auto mode).");
+          "(`deny` rules block even in auto mode)." + (r.sandbox ? " " + r.sandbox[0].toUpperCase() + r.sandbox.slice(1) + "." : ""));
       }
       case "rewind": {
         const t = await c.call("transcript", {}, 10000);

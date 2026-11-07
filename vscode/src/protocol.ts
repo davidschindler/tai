@@ -31,7 +31,11 @@ export interface TaiState {
   usage: Usage;
   todos?: TodoItem[];
   jobs?: JobInfo[];
+  commands?: CustomCommand[];
 }
+
+/** One of the user's own commands (a Markdown file in .tai/commands/ or tai's commands folder). */
+export interface CustomCommand { name: string; description: string; scope: "project" | "yours" }
 
 export interface TodoItem { content: string; status: "pending" | "in_progress" | "completed" }
 export interface JobInfo { id: string; command: string; running: boolean; code: number | null;
@@ -44,7 +48,7 @@ export interface FileDiff {
 }
 
 export type TranscriptItem =
-  | { type: "user"; index: number; text: string; files: string[]; context: string; kind: string; time?: number }
+  | { type: "user"; index: number; text: string; files: string[]; context: string; kind: string; time?: number; images?: string[] }
   | { type: "assistant"; text: string; streaming?: boolean }
   | { type: "tool"; id: string; name: string; label: string; shown: string; args: Record<string, unknown>;
       output: string; summary: string; error: boolean; done: boolean }
@@ -53,7 +57,7 @@ export type TranscriptItem =
 /** Events from `tai --serve` (method "event"). */
 export type TaiEvent =
   | { type: "ready"; version: string; protocol: number; hasKey?: boolean }
-  | { type: "user"; index: number; clientId?: string | null; injected: boolean; text: string; files: string[]; context: string }
+  | { type: "user"; index: number; clientId?: string | null; injected: boolean; text: string; files: string[]; context: string; images?: string[] }
   | { type: "turn_start"; index: number }
   | { type: "text"; delta: string }
   | { type: "message_end" }
@@ -152,7 +156,8 @@ export type HostMessage =
 /** Webview → extension host. */
 export type WebviewMessage =
   | { type: "ready" }
-  | { type: "send"; text: string; clientId: string; includeContext: boolean }
+  | { type: "send"; text: string; clientId: string; includeContext: boolean;
+      images?: { name: string; data: string }[]; command?: string; arg?: string }
   | { type: "cancel" }
   | { type: "approve"; requestId: string; decision: Decision; feedback?: string }
   | { type: "openDiff"; requestId?: string; diff?: FileDiff }

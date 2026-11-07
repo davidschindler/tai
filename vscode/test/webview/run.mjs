@@ -428,6 +428,62 @@ describe("webview", { concurrency: false }, () => {
     await done(h);
   });
 
+  it("attaches a pasted screenshot to the next message", async () => {
+    const h = await harness();
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    await h.page.click("#input");
+    await h.page.evaluate((b64) => {
+      const bytes = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+      const dt = new DataTransfer();
+      dt.items.add(new File([bytes], "image.png", { type: "image/png" }));
+      document.getElementById("input").dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+    }, png);
+    await h.waitSel(".chip.image img");
+    assert.equal(await h.page.$eval("#sendBtn", (b) => b.disabled), false, "an image alone can be sent");
+    assert.deepEqual(await h.text(".chip.image .chip-text"), ["image 1.png"]);
+    await h.type("what is in this picture?");
+    await h.shot(SHOTS, "13-pasted-image");
+    await h.page.keyboard.press("Enter");
+    await h.waitIdle();
+    assert.equal(await h.page.$(".chip.image"), null, "the composer chip is gone after sending");
+    assert.match((await h.text(".msg.user .meta"))[0], /image 1\.png/);
+    const sent = h.toHost.find((m) => m.type === "send");
+    assert.match(sent.images[0].data, /^data:image\/png;base64,/);
+    const t = await h.client.call("transcript");
+    assert.deepEqual(t.transcript.find((i) => i.type === "user").images, ["image 1.png"]);
+    await done(h);
+  });
+
+  it("runs /review and the user's own commands", async () => {
+    const h = await harness();
+    const { execFileSync } = await import("node:child_process");
+    const git = (...a) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", ...a], { cwd: h.ws });
+    git("init", "-q");
+    fs.writeFileSync(path.join(h.ws, "a.py"), "x = 1\n");
+    git("add", ".");
+    git("commit", "-q", "-m", "one");
+    fs.writeFileSync(path.join(h.ws, "a.py"), "x = 2\n");
+    fs.mkdirSync(path.join(h.ws, ".tai", "commands"), { recursive: true });
+    fs.writeFileSync(path.join(h.ws, ".tai", "commands", "greet.md"), "---\ndescription: Say hello\n---\nGreet $ARGUMENTS warmly.");
+    h.post({ type: "event", event: { type: "state", state: await h.client.call("state") } });
+    await h.type("/gr");
+    await h.waitSel("#menu:not([hidden])");
+    assert.match((await h.text("#menu"))[0], /\/greet[\s\S]*Say hello \(project\)/);
+    await h.page.keyboard.press("Escape");
+    await h.page.$eval("#input", (i) => { i.value = ""; });
+    await h.sendText("/greet Ana");
+    await h.waitIdle();
+    assert.deepEqual(await h.text(".msg.user .bubble"), ["/greet Ana"]);
+    assert.match((await h.text(".msg.assistant .md")).at(-1), /Echo: Greet Ana warmly\./);
+    await h.sendText("/review");
+    await h.waitIdle();
+    assert.deepEqual(await h.text(".msg.user .bubble"), ["/greet Ana", "/review"]);
+    const notices = await h.text(".notice");
+    assert.ok(notices.some((t) => /Reviewing 2 files, not committed/.test(t)), JSON.stringify(notices));
+    assert.match((await h.text(".msg.assistant .md")).at(-1), /Echo: Review the changes that are not committed yet/);
+    await done(h);
+  });
+
   it("streams a long answer without errors", async () => {
     const h = await harness();
     const long = Array.from({ length: 400 }, (_, i) => `Line ${i} with \`code\` and **bold** text.`).join("\n\n");

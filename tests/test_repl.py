@@ -315,3 +315,33 @@ def test_background_job_in_a_live_session(term):
     p.expect("job says hi")                  # the last line it printed
     p.sendline("/exit")
     p.expect(pexpect.EOF)
+
+
+def test_review_and_own_commands_in_a_live_session(term):
+    import shutil
+    import subprocess
+    if not shutil.which("git"):
+        pytest.skip("needs git")
+    p = term()
+    g = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *a],
+                                  cwd=p.ws, check=True, capture_output=True)
+    (p.ws / "a.py").write_text("x = 1\n")
+    g("init", "-q")
+    g("add", ".")
+    g("commit", "-q", "-m", "one")
+    (p.ws / "a.py").write_text("x = 2\n")
+    p.sendline("/review")
+    p.expect("reviewing 1 file, not committed")
+    p.expect("Echo: Review the changes that are not committed yet")
+    done(p)
+    (p.ws / ".tai" / "commands").mkdir(parents=True)
+    (p.ws / ".tai" / "commands" / "hi.md").write_text("---\ndescription: Greets someone\n---\nSay hi to $ARGUMENTS.")
+    p.sendline("/help")
+    p.expect("Your own commands")
+    p.expect("/hi +Greets someone")
+    p.expect(PROMPT)
+    p.sendline("/hi Ana")
+    p.expect("Echo: Say hi to Ana.")
+    done(p)
+    p.sendline("/exit")
+    p.expect(pexpect.EOF)

@@ -187,6 +187,8 @@ pre.cmd { font-weight: 600; }
 .chip.small { font-size: .78em; color: var(--dim); }
 .chip .chip-text, .chip span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chip.off .chip-text { text-decoration: line-through; opacity: .6; }
+.chip.image { padding-left: 2px; }
+.chip.image img { height: 22px; max-width: 40px; object-fit: cover; border-radius: 6px; }
 .chip .eye { opacity: .7; display: inline-flex; }
 #input { display: block; width: 100%; resize: none; border: none; outline: none; background: transparent; color: var(--vscode-input-foreground); font: inherit; padding: 8px 10px 4px; min-height: 2.4em; max-height: 40vh; }
 #input::placeholder { color: var(--vscode-input-placeholderForeground); }

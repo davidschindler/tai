@@ -138,7 +138,8 @@ export class Harness {
           const attachments = [...m.text.matchAll(/(?:^|\s)@([^\s]+)/g)].map((x) => ({ path: x[1] }))
             .filter((a) => fs.existsSync(path.resolve(this.ws, a.path)));
           const context = m.includeContext && this.context ? this.context : null;
-          await c.call("send", { text: m.text, clientId: m.clientId, attachments, context });
+          await c.call("send", { text: m.text, clientId: m.clientId, attachments, context,
+            ...(m.images ? { images: m.images } : {}), ...(m.command ? { command: m.command, arg: m.arg ?? "" } : {}) });
           break;
         }
         case "cancel": {

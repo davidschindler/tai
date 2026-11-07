@@ -239,6 +239,14 @@ MODE_INFO = {"manual": "asks before edits, commands and fetches",
              "auto": "edits, commands and fetches run without asking (secret files still ask)"}
 
 
+def mode_info():
+    info = dict(MODE_INFO)
+    if SANDBOX.active():
+        info["auto"] = ("edits in this folder, commands in the sandbox and fetches run without asking; "
+                        "anything outside the sandbox asks")
+    return info
+
+
 # ================================================================ saved permissions
 # settings.json in tai's folder holds rules that last beyond a session:
 #   {"allow": {"commands": ["git status"], "sites": ["docs.python.org"]},
@@ -755,6 +763,88 @@ def est_tokens(s):
     return max(1, len(s) // 4)
 
 
+# ---- images: sent to the model as image_url parts (data URLs) in user messages and tool results
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+               ".webp": "image/webp"}
+MAX_IMAGE = 3_750_000       # bytes: about 5 MB as base64, the limit of several models
+IMAGE_TOKENS = 1600         # rough cost of one image in the context window
+DATA_URL = re.compile(r"data:(image/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=\s]+)$")
+
+
+def is_image(path):
+    return Path(path).suffix.lower() in IMAGE_TYPES
+
+
+def image_part(data, mime):
+    import base64
+    if len(data) > MAX_IMAGE:
+        raise ToolError(f"the image is too large ({len(data) / 1e6:.1f} MB; at most {MAX_IMAGE / 1e6:.1f} MB)")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}}
+
+
+def image_file_part(path):
+    try:
+        data = Path(path).read_bytes()
+    except FileNotFoundError:
+        raise ToolError(f"file not found: {show_path(path)}")
+    except OSError as e:
+        raise ToolError(f"cannot read {show_path(path)}: {e.strerror}")
+    return image_part(data, IMAGE_TYPES[Path(path).suffix.lower()]), len(data)
+
+
+def data_url_part(url):
+    """An image pasted in the editor (a data: URL) as an image part; ValueError if it isn't one."""
+    import base64
+    m = DATA_URL.match(str(url or "").strip())
+    if not m:
+        raise ValueError("not a PNG, JPEG, GIF or WebP image")
+    return image_part(base64.b64decode(m.group(2)), m.group(1))
+
+
+def with_images(text, images):
+    """Message content: the text alone, or text and image parts."""
+    if not images:
+        return text
+    return ([{"type": "text", "text": text}] if text else []) + list(images)
+
+
+def join_content(items):
+    """Joins message contents (strings or part lists) into one."""
+    texts, images = [], []
+    for c in items:
+        if isinstance(c, list):
+            t = "".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+            images += [p for p in c if isinstance(p, dict) and p.get("type") == "image_url"]
+        else:
+            t = c or ""
+        if t:
+            texts.append(t)
+    return with_images("\n\n".join(texts), images)
+
+
+def count_images(obj):
+    if isinstance(obj, dict):
+        return (obj.get("type") == "image_url") + sum(count_images(v) for v in obj.values())
+    if isinstance(obj, list):
+        return sum(count_images(v) for v in obj)
+    return 0
+
+
+def without_images(obj, note="[image]"):
+    """A copy with image parts replaced by a short text (for size estimates and cut-down requests)."""
+    if isinstance(obj, dict):
+        if obj.get("type") == "image_url":
+            return {"type": "text", "text": note}
+        return {k: without_images(v, note) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [without_images(v, note) for v in obj]
+    return obj
+
+
+def msgs_tokens(msgs):
+    return est_tokens(json.dumps(without_images(msgs))) + IMAGE_TOKENS * count_images(msgs)
+
+
 # ================================================================ permissions
 
 class Denied(Exception):
@@ -782,8 +872,14 @@ class Permissions:
         self.mode = MODES[(MODES.index(self.mode) + 1) % len(MODES)]
         return self.mode
 
-    def auto_ok(self, kind):
+    def auto_ok(self, kind, detail=None):
+        detail = detail or {}
+        if kind == "edit" and self.mode in ("auto", "accept-edits") and detail.get("path") \
+                and SANDBOX.enabled() and outside_workspace(detail["path"]):
+            return False                    # edits outside the workspace ask
         if self.mode == "auto":
+            if kind == "bash" and detail.get("outside_sandbox") and SANDBOX.active():
+                return False
             return kind != "read"           # secret files always ask
         return self.mode == "accept-edits" and kind == "edit"
 
@@ -795,7 +891,7 @@ class Permissions:
         rule = SETTINGS.denied(kind, detail)
         if rule:
             raise Blocked(rule)
-        return kind in self.always or self.auto_ok(kind) or SETTINGS.allowed(kind, detail)
+        return kind in self.always or self.auto_ok(kind, detail) or SETTINGS.allowed(kind, detail)
 
     def always_choice(self, kind, detail):
         """(text after "Yes, and don't ask again ", what to do when chosen)."""
@@ -958,6 +1054,10 @@ def tool_read_file(a, perms):
     if is_sensitive(path):
         perms.check("read", "This file may contain secrets. Send it to the model?",
                     "Read sensitive file", show_path(path), detail={"type": "read", "path": str(path)})
+    if is_image(path) and path.is_file():
+        part, size = image_file_part(path)
+        return ([{"type": "text", "text": f"The image {show_path(path)} ({human(size)}B):"}, part],
+                f"Read image ({human(size)}B)")
     if path.is_file() and path.suffix.lower() == ".pdf":
         text = pdf_to_text(path.read_bytes())
         lines = text.splitlines()
@@ -1134,19 +1234,26 @@ def tool_edit_file(a, perms):
 def tool_bash(a, perms):
     cmd = a["command"]
     bg = bool(a.get("run_in_background"))
+    outside = bool(a.get("outside_sandbox"))
     body = Text(cmd.strip(), style="bold") if RICH else cmd
-    perms.check("bash", "Run this command in the background?" if bg else "Run this command?",
-                f"{SHELL_LABEL} command" + (" · background" if bg else ""), body,
-                detail={"type": "bash", "command": cmd, "shell": SHELL_LABEL, "background": bg})
+    sandbox = perms.mode == "auto" and SANDBOX.active()
+    question = "Run this command in the background?" if bg else "Run this command?"
+    if sandbox and outside:
+        question = question[:-1] + " outside the sandbox (with network, writing anywhere)?"
+    perms.check("bash", question,
+                f"{SHELL_LABEL} command" + (" · background" if bg else "") + (" · outside sandbox" if sandbox and outside else ""),
+                body, detail={"type": "bash", "command": cmd, "shell": SHELL_LABEL, "background": bg,
+                              "outside_sandbox": outside})
+    sandboxed = sandbox and not outside and perms.mode == "auto"    # (the mode may change while asking)
     if bg:
-        job = start_job(cmd)
+        job = start_job(cmd, sandboxed)
         return (f"Started in the background as job {job.id}. It keeps running while you continue; "
                 f"read its output with job_output (job_id \"{job.id}\", optionally wait=seconds), stop it "
                 "with job_stop. It is stopped when tai exits; you are told when it finishes.",
                 f"Started job {job.id} in the background")
     timeout = min(max(int(a.get("timeout") or 120), 1), 600)
     with working(f"Running {clip(cmd, 50)}…"):
-        return _run_bash(cmd, timeout)
+        return _run_bash(cmd, timeout, sandboxed)
 
 
 def shell_argv(cmd):
@@ -1173,19 +1280,167 @@ def kill_tree(proc):
         pass
 
 
-def spawn_shell(cmd):
+def spawn_shell(cmd, sandboxed=False):
     """Start cmd in tai's shell: output (stdout + stderr) on a pipe, own process group, no
-    secret environment variables, no console window."""
+    secret environment variables, no console window; inside the sandbox if sandboxed."""
     env = {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
     extra = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW} if WINDOWS
              else {"start_new_session": True})
-    return subprocess.Popen(shell_argv(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    argv = shell_argv(cmd)
+    if sandboxed:
+        argv = SANDBOX.wrap(argv)
+    return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
                             env=env, **extra)
 
 
-def _run_bash(cmd, timeout):
-    proc = spawn_shell(cmd)
+# ================================================================ sandbox
+# In auto mode, commands run in a sandbox where they can write only in the workspace folder and
+# the temp folder, and can't open network connections. A command that needs more is run with
+# outside_sandbox, which asks the user. Linux: Landlock (kernel 5.13+; network rules 6.7+),
+# applied by a small helper that then starts the shell. macOS: sandbox-exec. Windows: none.
+
+LANDLOCK_HELPER = r"""
+import ctypes, json, os, struct, sys
+spec, argv = json.loads(sys.argv[1]), sys.argv[2:]
+libc = ctypes.CDLL(None, use_errno=True)
+sc = libc.syscall
+sc.restype = ctypes.c_long
+def fail(what):
+    sys.stderr.write("tai sandbox: %s failed (%s)\n" % (what, os.strerror(ctypes.get_errno())))
+    sys.exit(126)
+abi = sc(444, None, 0, 1)
+if abi < 1:
+    fail("Landlock")
+fs = 0x2 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000
+fs |= (0x2000 if abi >= 2 else 0) | (0x4000 if abi >= 3 else 0)
+net = 0x3 if abi >= 4 and not spec["network"] else 0
+attr = struct.pack("QQ", fs, net) if abi >= 4 else struct.pack("Q", fs)
+fd = sc(444, ctypes.create_string_buffer(attr, len(attr)), len(attr), 0)
+if fd < 0:
+    fail("creating the rules")
+for p in spec["write"]:
+    try:
+        pfd = os.open(p, os.O_PATH | os.O_CLOEXEC)
+    except OSError:
+        continue
+    access = fs if os.path.isdir(p) else fs & 0x4002
+    rule = struct.pack("=Qi", access, pfd)
+    if sc(445, fd, 1, ctypes.create_string_buffer(rule, len(rule)), 0) != 0:
+        fail("a rule for " + p)
+    os.close(pfd)
+if libc.prctl(38, 1, 0, 0, 0) != 0 or sc(446, fd, 0) != 0:
+    fail("Landlock")
+os.close(fd)
+os.execvp(argv[0], argv)
+"""
+
+SEATBELT = """(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write* (subpath "/dev") %s)
+%s"""
+
+
+class Sandbox:
+    def __init__(self):
+        self._kind = False
+
+    @property
+    def kind(self):
+        """'Landlock', 'macOS sandbox' or None (not available on this system)."""
+        if self._kind is False:
+            self._kind = None
+            if sys.platform == "darwin" and os.path.exists("/usr/bin/sandbox-exec"):
+                self._kind = "macOS sandbox"
+            elif sys.platform.startswith("linux"):
+                try:
+                    import ctypes
+                    libc = ctypes.CDLL(None, use_errno=True)
+                    libc.syscall.restype = ctypes.c_long
+                    self.abi = libc.syscall(444, None, 0, 1)
+                    if self.abi >= 1:
+                        self._kind = "Landlock"
+                except (OSError, AttributeError):
+                    pass
+        return self._kind
+
+    def settings(self):
+        d = SETTINGS.load().get("sandbox")
+        d = d if isinstance(d, dict) else {}
+        extra = d.get("writable")
+        return {"enabled": d.get("enabled", True) is not False, "network": d.get("network") is True,
+                "writable": [str(x) for x in extra] if isinstance(extra, list) else []}
+
+    def enabled(self):
+        """Edits outside the workspace ask in auto mode (everywhere, also without an OS sandbox)."""
+        return self.settings()["enabled"]
+
+    def active(self):
+        """Commands in auto mode run sandboxed."""
+        return self.enabled() and self.kind is not None
+
+    def network_blocked(self):
+        return not self.settings()["network"] and (self.kind == "macOS sandbox" or getattr(self, "abi", 0) >= 4)
+
+    def writable(self):
+        st = self.settings()
+        paths = [Path.cwd(), Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp")]
+        paths += [Path(os.path.expanduser(x)) for x in st["writable"]]
+        out = []
+        for p in paths:
+            r = os.path.realpath(p)
+            if os.path.exists(r) and r not in out:
+                out.append(r)
+        return out
+
+    def wrap(self, argv):
+        st = self.settings()
+        if self.kind == "Landlock":
+            spec = json.dumps({"write": self.writable() + ["/dev"], "network": st["network"]})
+            return [sys.executable, "-I", "-S", "-c", LANDLOCK_HELPER, spec] + argv
+        if self.kind == "macOS sandbox":
+            ws = self.writable()
+            allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(ws)))
+            net = "" if st["network"] else '(deny network-outbound (remote ip "*:*"))'
+            params = [x for i, w in enumerate(ws) for x in ("-D", f"W{i}={w}")]
+            return ["/usr/bin/sandbox-exec", "-p", SEATBELT % (allow, net)] + params + argv
+        raise ToolError("no sandbox is available on this system")
+
+    def describe(self):
+        """One line for /permissions and the editor."""
+        if not self.enabled():
+            return "sandbox: off (settings.json) — in auto mode commands run without limits"
+        if not self.kind:
+            return ("sandbox: not available on this system — in auto mode commands run without limits "
+                    "(file edits outside this folder still ask)")
+        net = "no network" if self.network_blocked() else "network allowed"
+        return (f"sandbox: on ({self.kind}) — in auto mode commands can write only in this folder and "
+                f"the temp folder, {net}; anything else asks")
+
+    def note(self):
+        """Appended to the output of a sandboxed command that failed."""
+        net = "no network connections, " if self.network_blocked() else ""
+        return (f"\n[This ran in tai's sandbox ({net}writes only in {Path.cwd()} and the temp folder). If the "
+                "sandbox is why it failed, run it again with outside_sandbox: true; the user is asked.]")
+
+
+SANDBOX = Sandbox()
+
+
+def outside_workspace(path):
+    """True for paths that auto mode's sandbox doesn't let tai edit without asking."""
+    try:
+        r = os.path.realpath(path)
+    except (OSError, ValueError):
+        return True
+    roots = [os.path.realpath(Path.cwd()), os.path.realpath(tempfile.gettempdir())]
+    roots += [os.path.realpath(os.path.expanduser(x)) for x in SANDBOX.settings()["writable"]]
+    return not any(r == root or r.startswith(root.rstrip(os.sep) + os.sep) for root in roots)
+
+
+def _run_bash(cmd, timeout, sandboxed=False):
+    proc = spawn_shell(cmd, sandboxed)
     note, deadline = "", time.time() + timeout
     try:
         while True:
@@ -1210,7 +1465,10 @@ def _run_bash(cmd, timeout):
         preview += f"\n… +{len(lines) - 5} lines"
     if proc.returncode:
         preview += f"\n[exit code {proc.returncode}]"
-    return f"{out}{note}\n[exit code {proc.returncode}]", preview + note
+    hint = SANDBOX.note() if sandboxed and proc.returncode and not CANCEL.is_set() else ""
+    if hint:
+        preview += " · in the sandbox"
+    return f"{out}{note}\n[exit code {proc.returncode}]{hint}", preview + note
 
 
 # ================================================================ background jobs
@@ -1224,14 +1482,15 @@ JOBS_LOCK = threading.Lock()
 class Job:
     """A command running in the background; its output is collected as it comes."""
 
-    def __init__(self, jid, cmd):
+    def __init__(self, jid, cmd, sandboxed=False):
         self.id, self.cmd, self.started, self.ended = jid, cmd, time.time(), None
+        self.sandboxed = sandboxed
         self.out, self.base, self.seen = "", 0, 0     # base: characters dropped from the front
         self.lock = threading.Lock()
         self.done = threading.Event()
         self.stopped = False
         self.announced = False      # the model was told that it finished
-        self.proc = spawn_shell(cmd)
+        self.proc = spawn_shell(cmd, sandboxed)
         threading.Thread(target=self._read, daemon=True, name=f"job-{jid}").start()
 
     def _read(self):
@@ -1294,14 +1553,14 @@ def human_secs(t):
     return f"{t}s" if t < 60 else f"{t // 60}m {t % 60:02d}s" if t < 3600 else f"{t // 3600}h {t % 3600 // 60:02d}m"
 
 
-def start_job(cmd):
+def start_job(cmd, sandboxed=False):
     with JOBS_LOCK:
         running = [j for j in JOBS.values() if not j.done.is_set()]
         if len(running) >= MAX_JOBS:
             raise ToolError(f"{MAX_JOBS} background jobs are already running; stop one with job_stop first")
         jid = f"b{len(JOBS) + 1}"
         try:
-            job = JOBS[jid] = Job(jid, cmd)
+            job = JOBS[jid] = Job(jid, cmd, sandboxed)
         except OSError as e:
             raise ToolError(f"cannot start the command: {e}")
     return job
@@ -1331,7 +1590,8 @@ def tool_job_output(a, perms):
     if len(text) > MAX_TOOL_OUTPUT:
         text = f"[... {len(text) - MAX_TOOL_OUTPUT} characters left out ...]\n" + text[-MAX_TOOL_OUTPUT:]
     lines = out.rstrip().splitlines()
-    return (f"{text}\n[job {job.id}: {job.state()}]",
+    hint = SANDBOX.note() if job.sandboxed and job.code and not job.stopped else ""
+    return (f"{text}\n[job {job.id}: {job.state()}]{hint}",
             f"{len(lines)} new line{'s' if len(lines) != 1 else ''} · {job.state()}")
 
 
@@ -1562,7 +1822,8 @@ S = {"type": "string"}
 # The shell tool: bash on Linux/macOS, PowerShell on Windows (named so the model writes the right syntax).
 SHELL_TOOL, SHELL_LABEL = ("powershell", "PowerShell") if WINDOWS else ("bash", "Bash")
 TOOLS = [
-    fn("read_file", "Read a text or PDF file; returns numbered lines. Use offset/limit for long files.",
+    fn("read_file", "Read a text or PDF file (returns numbered lines; use offset/limit for long files), or "
+       "look at an image (PNG, JPEG, GIF, WebP), e.g. a plot or a screenshot.",
        {"path": S, "offset": {"type": "integer", "description": "1-based first line"},
         "limit": {"type": "integer", "description": "max lines, default 2000"}}, ["path"]),
     fn("list_files", "List files and folders matching a glob pattern such as '*', '**/*.py' or "
@@ -1585,7 +1846,11 @@ TOOLS = [
        {"command": S, "timeout": {"type": "integer", "description": "seconds, default 120, max 600"},
         "run_in_background": {"type": "boolean", "description":
             "start it and return at once, for servers, watchers and long jobs; read its output "
-            "later with job_output"}},
+            "later with job_output"},
+        "outside_sandbox": {"type": "boolean", "description":
+            "in auto mode commands run in a sandbox (no network, writes only in the current folder "
+            "and the temp folder); set this to run one without it, e.g. to install packages or "
+            "download data. The user is asked first. Only when needed."}},
        ["command"]),
     fn("job_output", "Read the new output of a background job (started with run_in_background) and "
        "whether it is still running. wait: seconds to wait for the job to finish first (max 600).",
@@ -1683,7 +1948,7 @@ def exec_tool(call, perms, runners=None):
         result, summary, style = f"Error: {e}", f"Error: {e}", "red"
     except (KeyError, TypeError, ValueError) as e:
         result, summary, style = f"Error: bad arguments ({e})", f"bad arguments ({e})", "red"
-    if len(result) > MAX_TOOL_OUTPUT:
+    if isinstance(result, str) and len(result) > MAX_TOOL_OUTPUT:
         half = MAX_TOOL_OUTPUT // 2
         result = (result[:half] + f"\n[... {len(result) - MAX_TOOL_OUTPUT} characters omitted ...]\n"
                   + result[-half:])
@@ -1850,6 +2115,8 @@ def system_prompt(use_tools, extra=None, sub=False, ide=False):
             "guessing.\n"
             "- Work step by step. Read a file before editing it; prefer edit_file with small, exact "
             "replacements over rewriting whole files.\n"
+            "- read_file also shows you images (PNG, JPEG, GIF, WebP): look at plots you made to check "
+            "them, and at screenshots the user mentions.\n"
             "- For current events, facts you're unsure of, papers or documentation: use web_search, "
             "then web_fetch to read the best sources. Cite URLs in your answer.\n"
             + ("" if sub else
@@ -2031,7 +2298,7 @@ def take_inbox():
 def run_turn(conv, perms, markdown, use_tools):
     """Run model ↔ tools until the model answers without tool calls."""
     msgs = conv["messages"]
-    tools = TOOLS if use_tools else None
+    tools = use_tools if isinstance(use_tools, list) else TOOLS if use_tools else None
     total_in = total_out = 0
     start = time.time()
     replied = auto_failed = retried = False
@@ -2091,7 +2358,7 @@ def run_turn(conv, perms, markdown, use_tools):
             msgs.append({"role": "user", "content": note})
         queued = take_inbox()
         if queued:
-            msgs.append({"role": "user", "content": "\n\n".join(queued)})
+            msgs.append({"role": "user", "content": join_content(queued)})
             dim(f"  ↳ tai is reading your {'message' if len(queued) == 1 else f'{len(queued)} messages'}")
         print()
     else:
@@ -2108,6 +2375,12 @@ def run_turn(conv, perms, markdown, use_tools):
 
 def read_file_block(path):
     p = Path(path).expanduser()
+    if is_image(p):
+        try:
+            part, size = image_file_part(p.resolve())
+        except ToolError as e:
+            raise RuntimeError(str(e)) from None
+        return [{"type": "text", "text": f'<file name="{p.name}">(image, attached below)</file>'}, part]
     try:
         text = decode(p.read_bytes())[0]
     except OSError as e:
@@ -2134,14 +2407,14 @@ def to_markdown(conv):
     out = [f"<!-- tai conversation · model: {conv['model']} -->\n"]
     for m in conv["messages"]:
         if m["role"] == "user":
-            out.append(f"## You\n\n{m['content']}\n")
+            out.append(f"## You\n\n{text_of(m['content'])}\n")
         elif m["role"] == "assistant":
             if m.get("content"):
                 out.append(f"## {conv['model']}\n\n{m['content']}\n")
             for tc in m.get("tool_calls") or []:
                 out.append(f"*→ {tc['function']['name']}* `{clip(tc['function']['arguments'], 200)}`\n")
         elif m["role"] == "tool":
-            out.append(f"<details><summary>tool result</summary>\n\n```\n{m['content'][:3000]}\n```\n"
+            out.append(f"<details><summary>tool result</summary>\n\n```\n{text_of(m['content'])[:3000]}\n```\n"
                        "</details>\n")
     return "\n".join(out)
 
@@ -2157,7 +2430,9 @@ HELP = """Commands:
   /compact [what to keep]  summarize the conversation to free up context (also automatic
                   when the context window is 80% full)
   /rewind [N]     go back to an earlier message and undo tai's file changes since then
-  /permissions    show the saved permission rules and where they are stored
+  /permissions    show the saved permission rules, where they are stored, and the sandbox
+  /review [REF] [focus]  review the changes in git: not yet committed, or everything since
+                  REF (a branch or commit, e.g. /review main); tai only reads, it changes nothing
   /jobs           commands running in the background; /jobs stop ID stops one
   /help           this help                   /exit     quit (or Ctrl+C twice, or Ctrl+D)
 Alt+Enter inserts a new line (pasting multi-line text also works).
@@ -2197,7 +2472,8 @@ def reset_system(conv):
                          "content": system_prompt(conv["tools"], conv.get("extra_system"))}] + msgs
 
 
-def ask(conv, perms, markdown, content):
+def ask(conv, perms, markdown, content, tools=None):
+    """tools: a tool list for this message only (e.g. read-only ones for /review)."""
     CANCEL.clear()
     msgs = conv["messages"]
     user = {"role": "user", "content": content}
@@ -2209,7 +2485,7 @@ def ask(conv, perms, markdown, content):
     msgs.append(user)
     start_checkpoint(conv, len(msgs) - 1)
     print()
-    run_turn(conv, perms, markdown, conv["tools"])
+    run_turn(conv, perms, markdown, conv["tools"] if tools is None else tools)
     if msgs and msgs[-1] is user:               # request failed before any reply: allow retry
         msgs.pop()
         turns = conv.get("turns") or []
@@ -2368,7 +2644,7 @@ def compact_conv(conv, instructions="", midway=False, auto=False):
     conv["turns"] = []
     with CHECKPOINT_LOCK:
         CHECKPOINT["turn"] = None
-    USAGE.ctx = est_tokens(json.dumps(msgs))
+    USAGE.ctx = msgs_tokens(msgs)
     save_conv(conv)
     dim(f"  conversation compacted · {human(before)} → {human(USAGE.ctx)} tokens"
         + (" · tai continues" if midway else " · /save shows the summary"))
@@ -2399,6 +2675,146 @@ def btw(conv, markdown, question):
     dim("  /btw · not added to the conversation")
 
 
+# ---- /review: the model reviews the changes in git (read-only tools for that turn)
+REVIEW_TOOLS = {"read_file", "list_files", "grep", "get_diagnostics"}
+MAX_REVIEW_DIFF = 150_000
+REVIEW_ASK = (
+    "Review {what} in this git repository and report the problems you find. Look for real defects: "
+    "bugs and wrong logic, edge cases that break, wrong results in analyses (e.g. merges, filters, "
+    "missing values, units), security problems, error handling that hides failures, and tests that "
+    "don't test what they claim. Read the surrounding code with read_file and grep where you need "
+    "it to be sure. Do NOT change any files.\n\n"
+    "Report the findings most important first. For each: file:line, what is wrong, a concrete case "
+    "where it goes wrong, and how to fix it. Leave out style preferences and nitpicks. If you find "
+    "nothing that matters, say so in one sentence.{focus}\n\n"
+    "Changed files:\n{stat}\n\n<diff>\n{diff}\n</diff>")
+
+
+def git(*args, check=True):
+    try:
+        r = subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60, **NO_WINDOW)
+    except FileNotFoundError:
+        raise RuntimeError("git is not installed") from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"git {args[0]} took too long") from None
+    if check and r.returncode:
+        raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout).strip()
+                           else f"git {args[0]} failed")
+    return r
+
+
+def review_request(arg):
+    """(message for the model, short description) for /review [REF] [what to focus on]."""
+    if git("rev-parse", "--is-inside-work-tree", check=False).returncode:
+        raise RuntimeError("/review needs a git repository (this folder is not one)")
+    words = arg.split(maxsplit=1)
+    ref = None
+    if words and not git("rev-parse", "--verify", "--quiet", words[0] + "^{commit}", check=False).returncode:
+        ref, arg = words[0], (words[1] if len(words) > 1 else "")
+    has_head = not git("rev-parse", "--verify", "--quiet", "HEAD", check=False).returncode
+    if ref:
+        mb = git("merge-base", ref, "HEAD", check=False)
+        base = mb.stdout.strip() if not mb.returncode and mb.stdout.strip() else ref
+        what = f"all changes since {ref} (committed and not yet committed)"
+    else:
+        base = "HEAD" if has_head else None
+        what = "the changes that are not committed yet"
+    diff_args = [base] if base else ["--cached"]
+    diff = git("diff", "--no-color", "--no-ext-diff", *diff_args).stdout
+    stat = git("diff", "--stat", "--no-color", *diff_args).stdout.rstrip()
+    new = [f for f in git("ls-files", "--others", "--exclude-standard", "-z").stdout.split("\0") if f]
+    extra = []
+    for f in new[:50]:
+        path = Path(f)
+        try:
+            if path.stat().st_size > 100_000 or is_binary(path):
+                extra.append(f"new file {f} (binary or large, not shown)")
+                continue
+            lines = read_text(path).splitlines()
+        except (OSError, ToolError):
+            continue
+        extra.append(f"diff --git a/{f} b/{f}\nnew file (not yet added to git)\n--- /dev/null\n+++ b/{f}\n"
+                     f"@@ -0,0 +1,{len(lines)} @@\n" + "\n".join("+" + l for l in lines))
+    if new:
+        stat += ("\n" if stat else "") + "\n".join(f" {f} (new, untracked)" for f in new[:50])
+    full = diff + ("\n" if diff and extra else "") + "\n".join(extra)
+    if not full.strip():
+        raise RuntimeError("nothing to review: there are no uncommitted changes "
+                           "(/review main reviews everything since main, /review HEAD~1 the last commit)")
+    if len(full) > MAX_REVIEW_DIFF:
+        full = full[:MAX_REVIEW_DIFF] + (f"\n[... the diff is {len(full)} characters; the rest is left out, "
+                                         "read the changed files for it ...]")
+    n = len([l for l in stat.splitlines() if "|" in l or "(new, untracked)" in l])
+    focus = f"\n\nThe user asks you to focus on: {arg.strip()}" if arg.strip() else ""
+    label = f"{n} file{'s' if n != 1 else ''}" + (f" since {ref}" if ref else ", not committed")
+    return REVIEW_ASK.format(what=what, focus=focus, stat=stat or "(none)", diff=full), label
+
+
+def review_tools(tools):
+    return [t for t in tools if t["function"]["name"] in REVIEW_TOOLS] if tools else tools
+
+
+# ---- custom commands: Markdown files in .tai/commands/ (this project) or <state dir>/commands/
+# (yours). /NAME runs the file's text as a message; $ARGUMENTS is replaced by what follows /NAME.
+BUILTIN_COMMANDS = {"help", "model", "models", "tools", "clear", "system", "file", "save", "btw", "mode",
+                    "usage", "compact", "rewind", "permissions", "jobs", "exit", "quit", "q", "review",
+                    "history", "terminal", "restart", "new"}
+
+
+def command_dirs():
+    return [("project", Path.cwd() / ".tai" / "commands"), ("yours", STATE_DIR / "commands")]
+
+
+def custom_commands():
+    """name -> {"description", "body", "path", "scope"}; project commands win over yours."""
+    out = {}
+    for scope, d in command_dirs():
+        try:
+            files = sorted(d.glob("*.md"))
+        except OSError:
+            continue
+        for f in files:
+            name = f.stem.lower()
+            if name in out or name in BUILTIN_COMMANDS or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", name):
+                continue
+            try:
+                text = read_text(f)
+            except ToolError:
+                continue
+            desc = ""
+            m = re.match(r"---\s*\n(.*?)\n---\s*\n", text, re.S)
+            if m:
+                text = text[m.end():]
+                for line in m.group(1).splitlines():
+                    k, _, v = line.partition(":")
+                    if k.strip().lower() == "description":
+                        desc = v.strip().strip("\"'")
+            body = text.strip()
+            if not body:
+                continue
+            desc = desc or clip(next((l.strip("# ").strip() for l in body.splitlines() if l.strip()), ""), 60)
+            out[name] = {"description": desc, "body": body, "path": str(f), "scope": scope}
+    return out
+
+
+def expand_command(cmd, arg):
+    body = cmd["body"]
+    if "$ARGUMENTS" in body:
+        return body.replace("$ARGUMENTS", arg.strip())
+    return body + (f"\n\n{arg.strip()}" if arg.strip() else "")
+
+
+def commands_help():
+    cmds = custom_commands()
+    if not cmds:
+        return ("Your own commands: put a Markdown file in .tai/commands/ (this project) or in "
+                f"{STATE_DIR / 'commands'} (all projects); /NAME then sends its text ($ARGUMENTS = what you "
+                "type after it).")
+    return "Your own commands:\n" + "\n".join(
+        f"  /{n:<14} {c['description']}  ({c['scope']})" for n, c in sorted(cmds.items()))
+
+
 COMMANDS = [("/help", "show commands"), ("/model", "show or switch model"), ("/models", "list models"),
             ("/tools", "toggle agent tools on/off"), ("/clear", "start a new conversation"),
             ("/system", "show or set extra instructions"), ("/file", "attach a file to your next message"),
@@ -2406,7 +2822,8 @@ COMMANDS = [("/help", "show commands"), ("/model", "show or switch model"), ("/m
             ("/mode", "show or set permission mode (shift+tab cycles)"), ("/usage", "token usage this session"),
             ("/compact", "summarize the conversation to free up context"),
             ("/rewind", "go back to an earlier message (and undo file changes)"),
-            ("/permissions", "show saved permission rules"),
+            ("/permissions", "show saved permission rules and the sandbox"),
+            ("/review", "review the changes in git (/review main: everything since main)"),
             ("/jobs", "background commands (/jobs stop ID)"),
             ("/exit", "quit")]
 
@@ -2430,7 +2847,8 @@ def make_reader(conv, perms):
         def get_completions(self, document, event):
             t = document.text_before_cursor
             if t.startswith("/") and " " not in t:
-                for cmd, desc in COMMANDS:
+                own = [(f"/{n}", c["description"]) for n, c in sorted(custom_commands().items())]
+                for cmd, desc in COMMANDS + own:
                     if cmd.startswith(t):
                         yield Completion(cmd, start_position=-len(t), display_meta=desc)
 
@@ -2445,7 +2863,7 @@ def make_reader(conv, perms):
         elif LIVE.busy:
             queued = stop_turn()
             if queued:      # give unsent messages back, like the VS Code extension
-                buf.insert_text("\n\n".join(queued))
+                buf.insert_text("\n\n".join(q if isinstance(q, str) else visible_text(q) for q in queued))
         elif time.time() - state["ctrl_c"] < 2:
             event.app.exit(exception=EOFError())
         else:
@@ -2615,7 +3033,7 @@ def repl(conv, perms, markdown, pending=None):
                         if not INBOX:
                             LIVE.busy = False
                             return
-                        c = "\n\n".join(INBOX)
+                        c = join_content(INBOX)
                         INBOX.clear()
                 while True:
                     ask(conv, perms, markdown, c)
@@ -2623,7 +3041,7 @@ def repl(conv, perms, markdown, pending=None):
                         # stop_turn() took what was queued before Ctrl+C; anything here was
                         # typed after it (while the stopped turn wound down): run it
                         if INBOX:
-                            c = "\n\n".join(INBOX)
+                            c = join_content(INBOX)
                             INBOX.clear()
                             continue
                         LIVE.busy = False
@@ -2686,6 +3104,11 @@ def _repl_line(text, conv, perms, markdown, pending, start):
     busy = LIVE.busy
     if text.startswith("/"):
         cmd, _, arg = text.partition(" ")
+        own = custom_commands().get(cmd[1:].lower())
+        if own:                     # one of your own commands: its text is the message
+            text = expand_command(own, arg)
+    if text.startswith("/"):
+        cmd, _, arg = text.partition(" ")
         arg = arg.strip()
         if busy and cmd not in BUSY_OK:
             err(f"{cmd} has to wait until tai is done (ctrl+c stops it)")
@@ -2694,6 +3117,7 @@ def _repl_line(text, conv, perms, markdown, pending, start):
             return "exit"
         elif cmd == "/help":
             print(HELP)
+            print(commands_help())
         elif cmd == "/models":
             print_models(conv["model"])
         elif cmd == "/model":
@@ -2707,7 +3131,7 @@ def _repl_line(text, conv, perms, markdown, pending, start):
                 return
             if arg:
                 perms.mode = arg
-            dim(f"mode: {perms.mode} — {MODE_INFO[perms.mode]}"
+            dim(f"mode: {perms.mode} — {mode_info()[perms.mode]}"
                 + ("" if arg else f"  (shift+tab or /mode {'|'.join(MODES)})"))
         elif cmd == "/usage":
             dim(f"session: {human(USAGE.inp)} in · {human(USAGE.out)} out · "
@@ -2735,16 +3159,26 @@ def _repl_line(text, conv, perms, markdown, pending, start):
             start(job=lambda: compact_conv(conv, arg))
         elif cmd == "/rewind":
             rewind(conv, arg)
+        elif cmd == "/review":
+            try:
+                content, label = review_request(arg)
+            except RuntimeError as e:
+                err(f"tai: {e}")
+                return
+            dim(f"  reviewing {label} · tai only reads files for this")
+            tools = review_tools(TOOLS) if conv["tools"] else None
+            start(job=lambda: ask(conv, perms, markdown, content, tools=tools))
         elif cmd == "/jobs":
             jobs_command(arg)
         elif cmd == "/permissions":
             lines = SETTINGS.describe()
-            dim(f"mode: {perms.mode} — {MODE_INFO[perms.mode]}")
+            dim(f"mode: {perms.mode} — {mode_info()[perms.mode]}")
             if perms.always:
                 dim("  allowed this session: " + ", ".join(sorted(perms.always)))
             for line in lines or ["  no saved rules yet (answer 2 to an approval to save one)"]:
                 dim(line)
             dim(f"  rules are saved in {SETTINGS.path} — edit it to add or remove them")
+            dim("  " + SANDBOX.describe())
         elif cmd == "/system":
             if arg:
                 conv["extra_system"] = arg
@@ -2771,7 +3205,7 @@ def _repl_line(text, conv, perms, markdown, pending, start):
             err(f"unknown command {cmd} — /help")
         return
 
-    content = "\n\n".join(pending + [text])
+    content = join_content(pending + [text])
     pending.clear()
     with INBOX_LOCK:
         if LIVE.busy:
@@ -3058,8 +3492,8 @@ def context_estimate(msgs):
     """Tokens the next request will send: the size at the last reply plus what came after it."""
     last = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), default=None)
     if last is None or not USAGE.ctx:
-        return est_tokens(json.dumps(msgs))
-    return USAGE.ctx + est_tokens(json.dumps(msgs[last + 1:]))
+        return msgs_tokens(msgs)
+    return USAGE.ctx + msgs_tokens(msgs[last + 1:])
 
 
 def compact_due(msgs):
@@ -3070,6 +3504,7 @@ def compact_due(msgs):
 
 
 def _shrunk(m):
+    m = without_images(m, "[image left out]")
     c = m.get("content")
     if m.get("role") in ("tool", "user") and isinstance(c, str) and len(c) > 4000:
         return {**m, "content": c[:2500] + f"\n[... {len(c) - 3500} characters left out ...]\n" + c[-1000:]}
@@ -3265,7 +3700,9 @@ class Server:
         return {"session": self.meta(), "model": self.conv["model"], "mode": self.perms.mode,
                 "tools": self.conv["tools"], "system": self.conv.get("extra_system") or "",
                 "busy": self.busy, "usage": self.usage(), "todos": self.conv.get("todos") or [],
-                "jobs": [j.info() for j in JOBS.values()]}
+                "jobs": [j.info() for j in JOBS.values()],
+                "commands": [{"name": n, "description": c["description"], "scope": c["scope"]}
+                             for n, c in sorted(custom_commands().items())]}
 
     def usage(self):
         return {"input": USAGE.inp, "output": USAGE.out, "ctx": USAGE.ctx, "maxCtx": USAGE.max_ctx}
@@ -3309,16 +3746,16 @@ class Server:
         items, results = [], {}
         for m in msgs:
             if m.get("role") == "tool":
-                results[m.get("tool_call_id")] = m.get("content") or ""
+                results[m.get("tool_call_id")] = text_of(m.get("content"))
         for i, m in enumerate(msgs):
             role = m.get("role")
             if role == "user":
                 d = disp.get(str(i)) or {}
                 if d.get("kind") == "hidden":
                     continue
-                items.append({"type": "user", "index": i, "text": d.get("text", m.get("content") or ""),
+                items.append({"type": "user", "index": i, "text": d.get("text", text_of(m.get("content"))),
                               "files": d.get("files") or [], "context": d.get("context") or "",
-                              "kind": d.get("kind") or "", "time": d.get("time")})
+                              "kind": d.get("kind") or "", "time": d.get("time"), "images": d.get("images") or []})
             elif role == "assistant":
                 if m.get("content"):
                     items.append({"type": "assistant", "text": m["content"]})
@@ -3346,12 +3783,24 @@ class Server:
     # ------------------------------------------------------------ composing user messages
     def compose(self, p):
         text = str(p.get("text") or "")
-        blocks, files = [], []
+        blocks, files, images, pasted = [], [], [], []
+        for im in p.get("images") or []:          # pasted into the chat (data: URLs)
+            name = str((im or {}).get("name") or "image") if isinstance(im, dict) else "image"
+            try:
+                images.append(data_url_part(im.get("data") if isinstance(im, dict) else im))
+                pasted.append(name)
+            except (ToolError, ValueError) as e:
+                raise ValueError(f"cannot attach {name}: {e}") from None
         for a in p.get("attachments") or []:
             try:
                 path = resolve(a["path"])
                 rel = show_path(path)
                 rng = a.get("range")
+                if is_image(path) and path.is_file():
+                    images.append(image_file_part(path)[0])
+                    blocks.append(f'<file path="{rel}">(image, attached below)</file>')
+                    files.append(rel)
+                    continue
                 if path.is_dir():
                     names = sorted(x.name + ("/" if x.is_dir() else "") for x in path.iterdir()
                                    if x.name not in SKIP_DIRS)[:500]
@@ -3397,7 +3846,9 @@ class Server:
             blocks.insert(0, "<ide_context>\n" + "\n".join(parts) + "\n</ide_context>")
         content = "\n\n".join(blocks + [text]) if blocks else text
         display = {"text": text, "files": files, "context": ctx_label, "time": time.time()}
-        return content, display
+        if pasted:
+            display["images"] = pasted
+        return with_images(content, images), display
 
     def add_user(self, content, display, client_id=None, injected=False):
         with self.lock:
@@ -3408,10 +3859,10 @@ class Server:
             self.cur_turn = {"msg": idx, "files": {}}
             self.session["turns"].append(self.cur_turn)
             if not self.session.get("title"):
-                self.session["title"] = clip(display.get("text") or content, 80)
+                self.session["title"] = clip(display.get("text") or text_of(content) or "image", 80)
         self.proto.event("user", index=idx, clientId=client_id, injected=injected,
                          text=display.get("text", ""), files=display.get("files") or [],
-                         context=display.get("context") or "")
+                         context=display.get("context") or "", images=display.get("images") or [])
         return idx
 
     def drop_user(self, idx):
@@ -3519,7 +3970,7 @@ class Server:
         except Exception as e:      # a tool must never take the session down
             result, summary, style = f"Error: {e}", f"Error: {e}", "red"
         if call["name"] == "todo_write" and style != "red":
-            m = re.search(r"\d+ of \d+ done", result)
+            m = re.search(r"\d+ of \d+ done", text_of(result))
             summary = m.group(0) if m else summary        # the list itself is in the panel
         diff = None
         lw = getattr(_tls, "last_write", None)
@@ -3529,7 +3980,7 @@ class Server:
                 diff = {"path": str(path), "old": old, "new": new}
         _tls.last_write = None
         self.proto.event("tool_end", id=call["id"], summary=summary, error=style == "red",
-                         output=result[:6000], diff=diff, agent=agent)
+                         output=text_of(result)[:6000], diff=diff, agent=agent)
         return result
 
     def interruptible(self, call):
@@ -3694,7 +4145,8 @@ class Server:
                 if not auto_failed and compact_due(msgs):
                     auto_failed = not compact(False)
                 try:
-                    text, calls, usage = self.stream(self.conv["model"], msgs, self.tools(), on_text=on_text)
+                    tools = review_tools(self.tools()) if display.get("readonly") else self.tools()
+                    text, calls, usage = self.stream(self.conv["model"], msgs, tools, on_text=on_text)
                 except RuntimeError as e:
                     if retried or not CONTEXT_FULL.search(str(e)) or self.streaming_text:
                         raise
@@ -3834,7 +4286,7 @@ class Server:
                 self.conv["display"]["3"] = {"kind": "hidden"}
             self.session["turns"] = []
             self.cur_turn = None
-            USAGE.ctx = est_tokens(json.dumps(msgs))
+            USAGE.ctx = msgs_tokens(msgs)
 
     def auto_compact(self, midway):
         """Compact during a turn; the editor shows it like /compact. Raises Cancelled."""
@@ -3885,12 +4337,29 @@ class Server:
         self.reset_system()
         model_window(self.conv["model"])
         return {"protocol": PROTOCOL_VERSION, "version": TAI_VERSION, "cwd": str(Path.cwd()),
-                "defaultModel": DEFAULT_MODEL, "modes": MODES, "modeInfo": MODE_INFO,
+                "defaultModel": DEFAULT_MODEL, "modes": MODES, "modeInfo": mode_info(),
                 "apiKey": bool(os.environ.get("TILBURG_AI_API_KEY")), "state": self.state()}
 
     def m_send(self, p):
+        cmd = str(p.get("command") or "").lower().lstrip("/")
+        if cmd:
+            arg = str(p.get("arg") or "")
+            typed = str(p.get("text") or f"/{cmd} {arg}".strip())
+            if cmd == "review":
+                body, label = review_request(arg)
+                content, display = self.compose({**p, "text": body, "context": None})
+                display.update(text=typed, kind="review", readonly=True, files=[])
+                self.proto.event("notice", level="info", text=f"Reviewing {label}; tai only reads files for this.")
+            else:
+                own = custom_commands().get(cmd)
+                if not own:
+                    raise ValueError(f"unknown command /{cmd}")
+                content, display = self.compose({**p, "text": expand_command(own, arg)})
+                display["text"] = typed
+            queued = self.start_turn(content, display, p.get("clientId"))
+            return {"queued": queued}
         content, display = self.compose(p)
-        if not content.strip():
+        if not text_of(content).strip() and not count_images(content):
             raise ValueError("empty message")
         queued = self.start_turn(content, display, p.get("clientId"))
         return {"queued": queued}
@@ -3935,7 +4404,7 @@ class Server:
 
     def m_permissions(self, p):
         """The settings file with the saved rules (created if missing), for the editor to open."""
-        return {"path": str(SETTINGS.ensure()), "rules": SETTINGS.describe()}
+        return {"path": str(SETTINGS.ensure()), "rules": SETTINGS.describe(), "sandbox": SANDBOX.describe()}
 
     def m_models(self, p):
         return {"models": [{"id": m["id"], "maxInput": m.get("max_input_tokens"),
@@ -4230,12 +4699,25 @@ def main():
 
     prompt = " ".join(args.prompt).strip()
     markdown = not args.raw
+    one_tools = None
+    if prompt.startswith("/"):
+        cmd, _, arg = prompt.partition(" ")
+        own = custom_commands().get(cmd[1:].lower())
+        if cmd == "/review":
+            try:
+                prompt, label = review_request(arg)
+            except RuntimeError as e:
+                sys.exit(f"tai: {e}")
+            dim(f"reviewing {label}")
+            one_tools = review_tools(TOOLS) if conv["tools"] else None
+        elif own:
+            prompt = expand_command(own, arg)
 
     if prompt or (piped and piped.strip()):
-        content = "\n\n".join(attachments + ([prompt] if prompt else []))
+        content = join_content(attachments + ([prompt] if prompt else []))
         if any(m.get("role") == "assistant" for m in conv["messages"]):
             model_window(conv["model"])     # a continued conversation may need compacting
-        ok = ask(conv, perms, markdown, content)
+        ok = ask(conv, perms, markdown, content, tools=one_tools)
         if not args.interactive:
             sys.exit(0 if ok else 1)
         attachments = []

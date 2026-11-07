@@ -43,6 +43,7 @@ tai
 ## Using it
 
 - **Approvals:** file edits, commands and web page fetches ask first: *1* yes, *2* yes and don't ask again, *3* no (and tell tai what to do instead). `Shift+Tab` switches between *manual*, *accept edits* and *auto*.
+- **Sandbox (auto mode):** on macOS and Linux, commands that tai runs on its own in auto mode can only write in the project folder and the temp folder, and can't connect to the internet. When a command needs more (installing a package, downloading data), tai asks first. File edits outside the project folder also ask. Windows has no sandbox: there, auto mode runs commands without limits. Turn it off or add folders in `settings.json`: `"sandbox": {"enabled": true, "network": false, "writable": ["~/data"]}`.
 - **Saved permissions:** *2* on a command such as `git status` or `pytest` remembers it for that folder, and on a web page for that site, also in later sessions. `/permissions` shows the rules and the file they are kept in (`settings.json` next to the saved conversations). You can edit it, including `deny` rules that block a command or site even in auto mode:
   ```json
   {
@@ -52,7 +53,10 @@ tai
   }
   ```
   A command rule covers commands that start with those words; an allow rule never covers commands chained with `;`, `&&`, `|`, `>` and the like.
-- `@file` attaches a file, `/` lists commands (`/btw` for a side question, `/model`, `/compact`, `/rewind`, `/permissions`, …), `Esc` stops tai (`Ctrl+C` in the terminal).
+- `@file` attaches a file, `/` lists commands (`/btw` for a side question, `/model`, `/compact`, `/rewind`, `/review`, `/permissions`, …), `Esc` stops tai (`Ctrl+C` in the terminal).
+- **Images:** paste a screenshot into the chat (`Ctrl+V`), or attach an image with `@plot.png` (`/file plot.png` or `-f plot.png` in the terminal). tai can also look at images itself, for example a plot it has just made.
+- **`/review`** reviews your changes in git and lists the problems it finds, without changing anything: `/review` for what isn't committed yet, `/review main` for everything since `main`, and anything after that tells it what to focus on.
+- **Your own commands:** a Markdown file in `.tai/commands/` (for this project, shareable with colleagues through git) or in `commands/` next to the saved conversations (for all your projects) becomes a command: `.tai/commands/referee.md` → `/referee`. `$ARGUMENTS` in the file is replaced with what you type after the command; a `description:` line in a `---` header shows in the `/` menu.
 - **While tai works** you can keep typing: `/btw QUESTION` is answered right away without disturbing the task, and a normal message is read at tai's next step.
 - **Long conversations:** when the context window is 80% full, tai summarizes the conversation so far and carries on, also in the middle of a task (`/compact` does it on request; set `TAI_AUTO_COMPACT=0` to turn the automatic one off).
 - **Task list:** for work with several steps tai keeps a checklist, shown above the input in VS Code and as `☒ ◼ ☐` in the terminal.

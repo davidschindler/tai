@@ -219,6 +219,7 @@ def test_cancel_running_command(client):
     m = c.mark()
     c.call("send", {"text": mock({"tools": [{"name": SHELL, "args": {"command": "sleep 30"}}]}, {"text": "x"})})
     c.wait("tool_start", start=m)
+    time.sleep(0.5)             # let the command start (a cancel before that denies it instead)
     t = time.time()
     c.call("cancel")
     end = c.wait("turn_end", start=m, timeout=5)

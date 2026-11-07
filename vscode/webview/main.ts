@@ -28,13 +28,18 @@ interface UiState {
   includeContext: boolean;
   history: string[];
   historyPos: number;
+  images: PastedImage[];
 }
+
+type PastedImage = { name: string; data: string };
+const MAX_IMAGE = 3_750_000;     // bytes; as in tai
 
 const saved = (vscode.getState() ?? {}) as { sessionId?: string; draft?: string; history?: string[] };
 const S: UiState = {
   settings: { ctrlEnterToSend: false, attachOpenFile: true, showTimestamps: false },
   cwd: "", version: "", modeInfo: {}, ready: false, busy: false, compacting: false, autoCompacting: false, turnStart: 0, outTokens: 0,
   writingTool: "", context: null, includeContext: true, history: saved.history ?? [], historyPos: -1,
+  images: [],
 };
 
 function persist() {
@@ -149,8 +154,15 @@ function clearEmpty() {
   messages.querySelector(".empty")?.remove();
 }
 
+function imageChip(name: string): HTMLElement {
+  const c = el("span", "chip small img");
+  c.innerHTML = icon("image") + `<span>${escapeHtml(name)}</span>`;
+  c.title = "Image sent with this message";
+  return c;
+}
+
 function addUser(text: string, opts: { index?: number; files?: string[]; context?: string; clientId?: string;
-  pending?: boolean; queued?: boolean; time?: number; kind?: string } = {}): HTMLElement {
+  pending?: boolean; queued?: boolean; time?: number; kind?: string; images?: string[] } = {}): HTMLElement {
   clearEmpty();
   if (opts.kind === "summary") {
     const d = el("details", "summary-block");
@@ -180,6 +192,7 @@ function addUser(text: string, opts: { index?: number; files?: string[]; context
     });
     meta.append(c);
   }
+  for (const name of opts.images ?? []) meta.append(imageChip(name));
   if (opts.queued) meta.append(el("span", "queued-label", "queued — sent when tai finishes its current step"));
   if (S.settings.showTimestamps) {
     meta.append(el("span", "time dim", new Date((opts.time ?? Date.now() / 1000) * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })));
@@ -379,7 +392,7 @@ function renderTranscript(items: TranscriptItem[]) {
   tasks.clear();
   assistant = null;
   for (const it of items) {
-    if (it.type === "user") addUser(it.text, { index: it.index, files: it.files, context: it.context, time: it.time, kind: it.kind });
+    if (it.type === "user") addUser(it.text, { index: it.index, files: it.files, context: it.context, time: it.time, kind: it.kind, images: it.images });
     else if (it.type === "assistant") {
       if (it.streaming) {          // the reply being written right now: keep appending to it
         const a = startAssistant();
@@ -559,7 +572,8 @@ const COMMANDS: [string, string][] = [
   ["/mode", "set permission mode (manual, accept-edits, auto)"],
   ["/history", "open an earlier conversation"],
   ["/rewind", "go back to an earlier message"],
-  ["/permissions", "show and edit the saved permission rules"],
+  ["/permissions", "show and edit the saved permission rules, and the sandbox"],
+  ["/review", "review the changes in git (/review main: everything since main)"],
   ["/jobs", "commands running in the background (/jobs stop ID)"],
   ["/tools", "toggle agent tools on/off (plain chat)"],
   ["/system", "set extra instructions for this conversation"],
@@ -573,7 +587,7 @@ const COMMANDS: [string, string][] = [
 const HELP = [
   "**Keys** — Enter send · Shift+Enter new line · Esc stop · Shift+Tab permission mode · ↑ previous message",
   "**In the editor** — Alt+K mention the selection · Ctrl+Esc focus tai · Ctrl+Shift+Esc new tab",
-  "**Mentions** — `@path` attaches a file or folder, `@file#L10-20` a line range",
+  "**Mentions** — `@path` attaches a file or folder (images too), `@file#L10-20` a line range; paste a screenshot with Ctrl+V",
   "",
   "**Commands**",
   "",
@@ -586,11 +600,11 @@ function autosize() {
 }
 
 function updateSendBtn() {
-  const stop = (S.busy || S.compacting) && !input.value.trim();
+  const stop = (S.busy || S.compacting) && !input.value.trim() && !S.images.length;
   sendBtn.innerHTML = icon(stop ? "stop" : "send");
   sendBtn.title = stop ? "Stop (Esc)" : S.busy ? "Queue message (sent at tai's next step)" : `Send (${S.settings.ctrlEnterToSend ? "Ctrl+Enter" : "Enter"})`;
   sendBtn.classList.toggle("stop", stop);
-  sendBtn.disabled = !stop && !input.value.trim();
+  sendBtn.disabled = !stop && !input.value.trim() && !S.images.length;
 }
 
 function updatePlaceholder() {
@@ -631,6 +645,16 @@ function updateToolbar() {
 
 function renderChips() {
   chips.replaceChildren();
+  S.images.forEach((im, i) => {
+    const chip = el("span", "chip image");
+    const img = document.createElement("img");
+    img.src = im.data;
+    img.alt = im.name;
+    chip.append(img, el("span", "chip-text", im.name));
+    chip.title = "Sent with your next message. Click to remove.";
+    chip.addEventListener("click", () => { S.images.splice(i, 1); renderChips(); updateSendBtn(); });
+    chips.append(chip);
+  });
   const c = S.context;
   if (!c || !S.settings.attachOpenFile) return;
   const chip = el("span", "chip ctx" + (S.includeContext ? "" : " off"));
@@ -646,7 +670,7 @@ function renderChips() {
 
 function submit() {
   const text = input.value.trim();
-  if (!text) {
+  if (!text && !S.images.length) {
     if (S.busy || S.compacting) send({ type: "cancel" });
     return;
   }
@@ -667,12 +691,20 @@ function submit() {
     }
     return;
   }
-  const msg = text.startsWith("//") ? text.slice(1) : text;
+  sendMessage(text.startsWith("//") ? text.slice(1) : text);
+}
+
+/** Sends a message (or a /review or custom command, which tai expands) and shows it. */
+function sendMessage(msg: string, command?: { name: string; arg: string }) {
   const id = clientId();
-  addUser(msg, { clientId: id, pending: !S.busy, queued: S.busy,
-    context: S.includeContext && S.settings.attachOpenFile && S.context ? ctxLabel(S.context) : undefined });
-  send({ type: "send", text: msg, clientId: id, includeContext: S.includeContext });
-  remember(text);
+  const images = S.images;
+  S.images = [];
+  const withContext = command?.name !== "review" && S.includeContext;
+  addUser(msg, { clientId: id, pending: !S.busy, queued: S.busy, images: images.map((i) => i.name),
+    context: withContext && S.settings.attachOpenFile && S.context ? ctxLabel(S.context) : undefined });
+  send({ type: "send", text: msg, clientId: id, includeContext: withContext,
+    ...(images.length ? { images } : {}), ...(command ? { command: command.name, arg: command.arg } : {}) });
+  remember(msg);
   input.value = "";
   S.includeContext = true;
   renderChips();
@@ -698,7 +730,10 @@ function runCommand(cmd: string, arg: string, _rest: string[]): boolean {
       clearEmpty();
       const n = el("div", "notice info");
       const md = el("div", "md");
-      renderMarkdown(md, HELP + (S.version ? `\n\n*tai ${S.version}*` : ""), hooks, true);
+      const own = ownCommands();
+      const ownHelp = own.length ? "\n\n**Your own commands**\n\n" + own.map((c) => `- \`${c[0]}\` ${c[1]}`).join("\n")
+        : "\n\n**Your own commands** — a Markdown file in `.tai/commands/` becomes a command: `.tai/commands/referee.md` → `/referee` (`$ARGUMENTS` = what you type after it).";
+      renderMarkdown(md, HELP + ownHelp + (S.version ? `\n\n*tai ${S.version}*` : ""), hooks, true);
       n.append(md);
       messages.append(n);
       scrollDown(true);
@@ -732,10 +767,21 @@ function runCommand(cmd: string, arg: string, _rest: string[]): boolean {
       }
       send({ type: "command", name: cmd, arg });
       return true;
+    case "review":
+      sendMessage(`/review${arg ? " " + arg : ""}`, { name: "review", arg });
+      return false;           // sendMessage already cleared the input
     default:
+      if ((S.state?.commands ?? []).some((c) => c.name === cmd)) {
+        sendMessage(`/${cmd}${arg ? " " + arg : ""}`, { name: cmd, arg });
+        return false;
+      }
       addNotice("error", `Unknown command /${cmd} — type /help`);
       return false;
   }
+}
+
+function ownCommands(): [string, string][] {
+  return (S.state?.commands ?? []).map((c) => [`/${c.name}`, c.description + (c.scope === "project" ? " (project)" : "")]);
 }
 
 // ---- slash and @ menus
@@ -781,7 +827,7 @@ function updateMenus() {
   const before = v.slice(0, pos);
   if (/^\/\S*$/.test(before) && !before.startsWith("//")) {
     const q = before.slice(1).toLowerCase();
-    openMenu("slash", COMMANDS.filter(([c]) => c.slice(1).startsWith(q)).map(([c, d]) => ({
+    openMenu("slash", [...COMMANDS, ...ownCommands()].filter(([c]) => c.slice(1).startsWith(q)).map(([c, d]) => ({
       label: c, desc: d, apply: () => {
         input.value = c + " " + v.slice(pos).trimStart();
         input.setSelectionRange(c.length + 1, c.length + 1);
@@ -847,6 +893,24 @@ input.addEventListener("input", () => {
   persist();
 });
 input.addEventListener("click", updateMenus);
+// pasted screenshots and images: attached to the next message
+input.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.items ?? [])].filter((i) => i.kind === "file" && /^image\/(png|jpeg|gif|webp)$/.test(i.type))
+    .map((i) => i.getAsFile()).filter((f): f is File => !!f);
+  if (!files.length) return;
+  e.preventDefault();
+  for (const f of files) {
+    if (f.size > MAX_IMAGE) { toast(`That image is too large (${(f.size / 1e6).toFixed(1)} MB; at most 3.7 MB)`); continue; }
+    const r = new FileReader();
+    r.onload = () => {
+      const n = S.images.length + 1;
+      S.images.push({ name: f.name && f.name !== "image.png" ? f.name : `image ${n}.${f.type.split("/")[1].replace("jpeg", "jpg")}`, data: String(r.result) });
+      renderChips();
+      updateSendBtn();
+    };
+    r.readAsDataURL(f);
+  }
+});
 input.addEventListener("blur", () => setTimeout(() => { if (document.activeElement !== input) closeMenu(); }, 150));
 
 input.addEventListener("keydown", (e) => {
@@ -958,7 +1022,7 @@ function onEvent(e: TaiEvent) {
         }
         // show the attachments tai resolved
         const meta = pending.querySelector(".meta")!;
-        meta.querySelectorAll(".chip").forEach((c) => c.remove());
+        meta.querySelectorAll(".chip:not(.img)").forEach((c) => c.remove());
         for (const f of [...(e.context ? [e.context] : []), ...e.files].reverse()) {
           const c = el("span", "chip small");
           c.innerHTML = icon("file") + `<span>${escapeHtml(f)}</span>`;
@@ -970,7 +1034,7 @@ function onEvent(e: TaiEvent) {
         }
       } else {
         endAssistant();
-        addUser(e.text, { index: e.index, files: e.files, context: e.context });
+        addUser(e.text, { index: e.index, files: e.files, context: e.context, images: e.images });
       }
       scrollDown();
       break;

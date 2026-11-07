@@ -151,6 +151,7 @@ const ICONS: Record<string, string> = {
   eyeoff: '<path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z" fill="none" stroke="currentColor"/><path d="M2 14L14 2" stroke="currentColor"/>',
   history: '<circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor"/><path d="M8 5v3l2 1.5" fill="none" stroke="currentColor" stroke-linecap="round"/>',
   plus: '<path d="M8 3v10M3 8h10" stroke="currentColor" stroke-linecap="round"/>',
+  image: '<rect x="2" y="3" width="12" height="10" rx="1.5" fill="none" stroke="currentColor"/><circle cx="6" cy="6.5" r="1.2" fill="currentColor"/><path d="M3 12l3.5-3.5 2.5 2.5 2-2 2 2" fill="none" stroke="currentColor" stroke-linejoin="round"/>',
   chevron: '<path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>',
   at: '<circle cx="8" cy="8" r="2.5" fill="none" stroke="currentColor"/><path d="M10.5 8v1a2 2 0 0 0 4 0V8a6.5 6.5 0 1 0-3 5.5" fill="none" stroke="currentColor" stroke-linecap="round"/>',
 };
