@@ -144,7 +144,7 @@ def test_broken_settings_file_is_ignored_with_a_warning(client):
     c.approve = lambda p: {"decision": "always"}
     _, end, m = c.send(mock({"tools": [sh("echo x")]}, {"text": "k"}))
     assert len(approvals(c, m)) == 1 and end["reason"] == "done"
-    assert "settings.json" in "".join(c.stderr)
+    assert "settings.json" in "".join(c.stderr).replace("\n", "")      # (rich may wrap the line)
     assert (c.state / "tai" / "settings.json").read_text() == "{ not json"     # not overwritten
 
 
