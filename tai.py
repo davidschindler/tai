@@ -2559,7 +2559,7 @@ def print_models(current=None):
 # The agent loop mirrors run_turn/subagent above, but reports structured events instead of printing.
 
 PROTOCOL_VERSION = 1
-TAI_VERSION = "1.3.2"
+TAI_VERSION = "1.3.3"
 SESSIONS = STATE_DIR / "sessions"
 MAX_PREVIEW = 2_000_000         # larger files are not sent to the editor for diff previews
 MAX_SNAPSHOT = 5_000_000        # larger files are not snapshotted for rewind
