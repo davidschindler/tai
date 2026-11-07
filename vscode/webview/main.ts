@@ -20,6 +20,7 @@ interface UiState {
   ready: boolean;
   busy: boolean;
   compacting: boolean;
+  autoCompacting: boolean;
   turnStart: number;
   outTokens: number;
   writingTool: string;
@@ -32,7 +33,7 @@ interface UiState {
 const saved = (vscode.getState() ?? {}) as { sessionId?: string; draft?: string; history?: string[] };
 const S: UiState = {
   settings: { ctrlEnterToSend: false, attachOpenFile: true, showTimestamps: false },
-  cwd: "", version: "", modeInfo: {}, ready: false, busy: false, compacting: false, turnStart: 0, outTokens: 0,
+  cwd: "", version: "", modeInfo: {}, ready: false, busy: false, compacting: false, autoCompacting: false, turnStart: 0, outTokens: 0,
   writingTool: "", context: null, includeContext: true, history: saved.history ?? [], historyPos: -1,
 };
 
@@ -185,7 +186,7 @@ function addUser(text: string, opts: { index?: number; files?: string[]; context
   actions.append(
     iconButton("rewind", "Rewind to here (edit & resend, optionally restore files)", () => {
       if (m.dataset.index) send({ type: "rewind", index: parseInt(m.dataset.index, 10) });
-    }),
+    }, "iconbtn rewind"),
     iconButton("copy", "Copy", () => hooks.copy(text)),
   );
   m.append(meta, actions);
@@ -406,7 +407,7 @@ setInterval(() => {
 
 function renderThinking() {
   const secs = Math.floor((Date.now() - S.turnStart) / 1000);
-  const verb = S.compacting ? "Compacting conversation…" : S.writingTool ? `Writing ${S.writingTool} call…`
+  const verb = S.compacting || S.autoCompacting ? "Compacting conversation…" : S.writingTool ? `Writing ${S.writingTool} call…`
     : assistant?.text ? "Responding…" : "Thinking…";
   const bits = [`${secs}s`];
   if (S.outTokens) bits.push(`↓ ~${human(S.outTokens)} tokens`);
@@ -556,6 +557,7 @@ const COMMANDS: [string, string][] = [
   ["/mode", "set permission mode (manual, accept-edits, auto)"],
   ["/history", "open an earlier conversation"],
   ["/rewind", "go back to an earlier message"],
+  ["/permissions", "show and edit the saved permission rules"],
   ["/tools", "toggle agent tools on/off (plain chat)"],
   ["/system", "set extra instructions for this conversation"],
   ["/usage", "token usage this session"],
@@ -700,7 +702,7 @@ function runCommand(cmd: string, arg: string, _rest: string[]): boolean {
       send({ type: "pickModel" });
       return true;
     case "model": case "tools": case "system": case "compact": case "usage": case "save":
-    case "history": case "resume": case "terminal": case "restart": case "rewind":
+    case "history": case "resume": case "terminal": case "restart": case "rewind": case "permissions":
       if (cmd === "compact" && !S.busy) {
         S.compacting = true;
         S.turnStart = Date.now();
@@ -1051,6 +1053,26 @@ function onEvent(e: TaiEvent) {
       btws.delete(e.id);
       break;
     }
+    case "auto_compact":
+      // the context window was nearly full during a turn: tai summarized the conversation
+      S.autoCompacting = e.phase === "start";
+      if (e.phase === "end") {
+        if (e.error === null) {
+          // earlier messages are now part of the summary: they can't be rewound to any more
+          messages.querySelectorAll<HTMLElement>(".msg.user[data-index]").forEach((b) => {
+            delete b.dataset.index;
+            b.querySelector(".actions .rewind")?.remove();
+          });
+          addNotice("info", "The context window was nearly full, so tai summarized the conversation so far and carries on. " +
+            `(${human(e.before)} → ${human(e.after ?? 0)} tokens)`);
+        } else if (e.error !== "cancelled") {
+          addNotice("warning", `Compacting failed: ${e.error}`);
+        }
+        if (S.state) S.state.usage = e.usage;
+        updateToolbar();
+      }
+      updateThinking();
+      break;
     case "compact_end":
       S.compacting = false;
       setBusy(false);

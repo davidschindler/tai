@@ -30,6 +30,7 @@ import os
 import platform
 import queue
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -201,6 +202,8 @@ class Usage:
         self.ctx = 0                # size of the main conversation at the last reply
         self.max_ctx = None         # context window of the current model (if known)
         self.streaming = 0          # estimated output tokens of replies still streaming
+        self.window_known = threading.Event()   # set when no model_window() lookup is running
+        self.window_known.set()
 
     def add(self, usage, main=False):
         if not usage:
@@ -234,6 +237,207 @@ MODES = ["manual", "accept-edits", "auto"]
 MODE_INFO = {"manual": "asks before edits, commands and fetches",
              "accept-edits": "file edits run without asking",
              "auto": "edits, commands and fetches run without asking (secret files still ask)"}
+
+
+# ================================================================ saved permissions
+# settings.json in tai's folder holds rules that last beyond a session:
+#   {"allow": {"commands": ["git status"], "sites": ["docs.python.org"]},
+#    "deny":  {"commands": ["git push"], "sites": []},
+#    "folders": {"/path/to/project": {"allow": {"commands": ["pytest"]}}}}
+# A command rule matches a command that starts with the same words ("git status" matches
+# "git status -s"); a rule with * or ? is a pattern for the whole command. Allow rules only
+# approve simple commands (no ; & | > < ` $ ( ) { }), so "git status" never approves
+# "git status; rm -rf ~". Deny rules are checked in every part of a command and win over
+# everything, auto mode included. Site rules match the host name (patterns like *.example.org).
+SETTINGS_FILE = STATE_DIR / "settings.json"
+SHELL_META = re.compile(r"[;&|<>`$(){}\n\r]")
+NO_RULE = {"sudo", "su", "doas", "env", "xargs", "eval", "exec", "nohup", "timeout", "watch", "time",
+           "nice", "command", "rm", "rmdir", "del", "erase", "rd", "remove-item", "ri", "find", "dd",
+           "mkfs", "chmod", "chown", "iex", "invoke-expression", "start-process", "cmd", "curl", "wget",
+           "invoke-webrequest", "iwr", "ssh", "scp"}
+INTERPRETERS = {"python", "python3", "py", "node", "rscript", "ruby", "perl", "bash", "sh", "zsh",
+                "pwsh", "powershell", "deno", "julia", "stata", "stata-mp", "stata-se", "matlab"}
+SUBCOMMANDS = {"git", "npm", "pnpm", "yarn", "npx", "pip", "pip3", "pipx", "uv", "conda", "mamba",
+               "cargo", "go", "docker", "kubectl", "dotnet", "brew", "apt", "poetry", "gh", "quarto",
+               "make", "hugo", "latexmk"}
+WRAPPERS = {"sudo", "doas", "nohup", "time", "command", "exec", "nice", "env", "xargs", "timeout"}
+
+
+def cmd_words(cmd):
+    """The words of a command, the program name normalized (basename, lower case, no .exe)."""
+    try:
+        w = shlex.split(cmd, posix=not WINDOWS)
+    except ValueError:
+        return None
+    if w:
+        head = re.split(r"[\\/]", w[0])[-1].lower()
+        w[0] = head[:-4] if head.endswith(".exe") else head
+    return w
+
+
+def command_rule(cmd):
+    """What 'don't ask again' saves for this command ("git status", "python run.py"), or None
+    when a rule would allow too much (rm, sudo, python -c, compound commands, …)."""
+    if SHELL_META.search(cmd):
+        return None
+    w = cmd_words(cmd.strip())
+    if not w or w[0] in NO_RULE:
+        return None
+    if w[0] in INTERPRETERS:
+        if len(w) >= 3 and w[1] == "-m" and not w[2].startswith("-"):
+            return " ".join(w[:3])
+        if len(w) >= 2 and not w[1].startswith("-"):
+            return " ".join(w[:2])
+        return None
+    if w[0] in SUBCOMMANDS:
+        return " ".join(w[:2]) if len(w) >= 2 and not w[1].startswith("-") else None
+    return w[0]
+
+
+def command_matches(cmd, rule):
+    rule = rule.strip()
+    if not rule:
+        return False
+    if any(c in rule for c in "*?["):
+        return fnmatch.fnmatchcase(" ".join(cmd.split()).lower(), " ".join(rule.split()).lower())
+    w, r = cmd_words(cmd.strip()), cmd_words(rule)
+    return bool(w and r) and w[:len(r)] == r
+
+
+def command_parts(cmd):
+    """Best-effort split of a compound command into its simple commands, wrappers removed."""
+    for part in re.split(r"[;&|\n\r`(){}]|\$\(", cmd):
+        w = cmd_words(part.strip()) or []
+        while w and (w[0] in WRAPPERS or re.fullmatch(r"\w+=.*", w[0]) or w[0].startswith("-")):
+            w = w[1:]
+            if w:
+                head = re.split(r"[\\/]", w[0])[-1].lower()
+                w[0] = head[:-4] if head.endswith(".exe") else head
+        if w:
+            yield " ".join(shlex.quote(x) for x in w) if not WINDOWS else " ".join(w)
+
+
+def site_matches(host, rule):
+    rule = rule.strip().lower()
+    return bool(rule) and (host == rule or fnmatch.fnmatchcase(host, rule))
+
+
+def _same_or_inside(path, folder):
+    try:
+        a = os.path.normcase(os.path.realpath(path))
+        b = os.path.normcase(os.path.realpath(os.path.expanduser(folder)))
+    except (OSError, ValueError):
+        return False
+    return a == b or a.startswith(b.rstrip(os.sep) + os.sep)
+
+
+class Settings:
+    """settings.json, re-read when it changes (so edits apply at once, also to a running session)."""
+
+    def __init__(self, path):
+        self.path, self.stamp, self.data, self.warned = path, None, {}, None
+        self.lock = threading.Lock()
+
+    def load(self):
+        with self.lock:
+            try:
+                st = self.path.stat()
+                stamp = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                self.stamp, self.data = None, {}
+                return self.data
+            if stamp != self.stamp:
+                self.stamp = stamp
+                try:
+                    d = json.loads(self.path.read_text(encoding="utf-8-sig"))
+                    if not isinstance(d, dict):
+                        raise ValueError("the file must hold a JSON object")
+                    self.data = d
+                except (OSError, ValueError) as e:
+                    self.data = {}
+                    if self.warned != stamp:
+                        self.warned = stamp
+                        err(f"tai: ignoring {self.path}: {e}")
+            return self.data
+
+    def rules(self, verdict, what):
+        def strs(x):
+            return [r for r in x if isinstance(r, str)] if isinstance(x, list) else []
+
+        def pick(d):
+            v = d.get(verdict) if isinstance(d, dict) else None
+            return strs(v.get(what)) if isinstance(v, dict) else []
+        d = self.load()
+        out = pick(d)
+        folders = d.get("folders")
+        if isinstance(folders, dict):
+            cwd = Path.cwd()
+            for folder, fd in folders.items():
+                if _same_or_inside(cwd, folder):
+                    out += pick(fd)
+        return out
+
+    def denied(self, kind, detail):
+        """The deny rule that blocks this request, or None."""
+        if kind == "bash":
+            cmd = str((detail or {}).get("command") or "")
+            parts = list(command_parts(cmd))
+            for r in self.rules("deny", "commands"):
+                if command_matches(cmd, r) or any(command_matches(p, r) for p in parts):
+                    return r
+        elif kind.startswith("fetch:"):
+            for r in self.rules("deny", "sites"):
+                if site_matches(kind[6:], r):
+                    return r
+        return None
+
+    def allowed(self, kind, detail):
+        if kind == "bash":
+            cmd = str((detail or {}).get("command") or "")
+            return not SHELL_META.search(cmd) and any(
+                command_matches(cmd, r) for r in self.rules("allow", "commands"))
+        if kind.startswith("fetch:"):
+            return any(site_matches(kind[6:], r) for r in self.rules("allow", "sites"))
+        return False
+
+    def add(self, verdict, what, rule, folder=None):
+        """Save a rule (raises OSError if the file can't be written)."""
+        with self.lock:
+            try:
+                d = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            except FileNotFoundError:
+                d = {}
+            except ValueError:
+                raise OSError(f"{self.path} is not valid JSON; fix or remove it first") from None
+            if not isinstance(d, dict):
+                raise OSError(f"{self.path} must hold a JSON object")
+            target = d
+            if folder is not None:
+                target = d.setdefault("folders", {}).setdefault(str(folder), {})
+            lst = target.setdefault(verdict, {}).setdefault(what, [])
+            if rule not in lst:
+                lst.append(rule)
+            write_json_atomic(self.path, d, indent=2)
+            self.stamp = None
+
+    def ensure(self):
+        """Create an empty settings file (for /permissions) and return its path."""
+        if not self.path.exists():
+            write_json_atomic(self.path, {"allow": {"commands": [], "sites": []},
+                                          "deny": {"commands": [], "sites": []}, "folders": {}}, indent=2)
+        return self.path
+
+    def describe(self):
+        lines = []
+        for verdict in ("allow", "deny"):
+            for what in ("commands", "sites"):
+                rs = self.rules(verdict, what)
+                if rs:
+                    lines.append(f"  {verdict} {what}: " + ", ".join(rs))
+        return lines
+
+
+SETTINGS = Settings(SETTINGS_FILE)
 
 
 # ================================================================ output helpers
@@ -557,6 +761,10 @@ class Denied(Exception):
     pass
 
 
+class Blocked(Denied):
+    """Refused by a deny rule in settings.json (the user was not asked)."""
+
+
 class ToolError(Exception):
     pass
 
@@ -579,35 +787,62 @@ class Permissions:
             return kind != "read"           # secret files always ask
         return self.mode == "accept-edits" and kind == "edit"
 
+    def preflight(self, kind, detail):
+        """Before asking: raises Blocked (deny rule) or Denied (cancelled); True when the
+        request is already allowed (this session, the mode, or a saved rule)."""
+        if CANCEL.is_set():
+            raise Denied("Cancelled.")
+        rule = SETTINGS.denied(kind, detail)
+        if rule:
+            raise Blocked(rule)
+        return kind in self.always or self.auto_ok(kind) or SETTINGS.allowed(kind, detail)
+
+    def always_choice(self, kind, detail):
+        """(text after "Yes, and don't ask again ", what to do when chosen)."""
+        if kind == "bash":
+            rule = command_rule(str((detail or {}).get("command") or ""))
+            if rule:
+                return (f"for `{rule}` commands in this folder",
+                        lambda: self._save("commands", rule, Path.cwd(), "bash"))
+            return "for any command this session", lambda: self.always.add("bash")
+        if kind.startswith("fetch:"):
+            host = kind[6:]
+            return f"for {host}", lambda: self._save("sites", host, None, kind)
+        text = {"edit": "for file edits this session", "read": "for sensitive files this session"}.get(
+            kind, "this session")
+        return text, lambda: self.always.add(kind)
+
+    def _save(self, what, rule, folder, kind):
+        try:
+            SETTINGS.add("allow", what, rule, folder)
+        except OSError as e:
+            self.always.add(kind)
+            err(f"tai: could not save the rule ({e}); allowed for this session only")
+
     def check(self, kind, question, title="Permission", body=None, detail=None):
         """kind: 'edit', 'bash', 'read' or 'fetch:<host>'. Raises Denied unless approved.
         Holds IO so the prompt isn't interleaved with sub-agent output (in the live prompt
         the question is the input line itself, so only the panel is printed under IO)."""
         if LIVE.active and threading.current_thread() is not threading.main_thread():
             with APPROVAL:
-                return self._check(kind, question, title, body, live=True)
+                return self._check(kind, question, title, body, detail, live=True)
         with IO:
-            return self._check(kind, question, title, body, live=False)
+            return self._check(kind, question, title, body, detail, live=False)
 
-    def _check(self, kind, question, title, body, live):
-        if CANCEL.is_set():
-            raise Denied("Cancelled.")
-        if kind in self.always:
-            return
-        if self.auto_ok(kind):
-            if kind == "edit" and body is not None:
+    def _check(self, kind, question, title, body, detail, live):
+        if self.preflight(kind, detail):
+            if kind == "edit" and body is not None and kind not in self.always:
                 say(body)               # still show what changed
             return
         label = getattr(_tls, "label", "")
-        always = "for this site" if kind.startswith("fetch:") else {
-            "edit": "for file edits", "bash": "for commands", "read": "for sensitive files"}.get(kind, "")
+        always, remember = self.always_choice(kind, detail)
         if RICH:
             items = []
             if body is not None:
                 items += [body, Text("")]
             items += [Text(question, style="bold"),
                       Text.assemble(("  1. ", GOLD), "Yes"),
-                      Text.assemble(("  2. ", GOLD), f"Yes, and don't ask again {always} this session"),
+                      Text.assemble(("  2. ", GOLD), f"Yes, and don't ask again {always}"),
                       Text.assemble(("  3. ", GOLD), "No, and tell tai what to do differently")]
             ttl = Text.assemble((f" {label} › " if label else " ", GREY), (title + " ", f"bold {GOLD}"))
             with IO:
@@ -629,7 +864,7 @@ class Permissions:
                 break
             say("  type 1, 2 or 3", GREY)
         if ans in ("2", "a", "always"):
-            self.always.add(kind)
+            remember()
             return
         if ans in ("1", "y", "yes"):
             return
@@ -1203,6 +1438,10 @@ def exec_tool(call, perms, runners=None):
     try:
         result, summary = runners[name](args, perms)
         style = "dim"
+    except Blocked as b:
+        result = (f"Blocked: the user's permission settings forbid this (rule: {b}). Do not try to "
+                  "get around the rule; if the step is needed, ask the user to do it or to change the rule.")
+        summary, style = f"Blocked by your settings (rule: {b})", "red"
     except Denied as d:
         result = "The user denied this action." + (f" The user says: {d}" if str(d) else "")
         summary, style = "Denied" + (f" — {d}" if str(d) else ""), "red"
@@ -1556,7 +1795,13 @@ def run_turn(conv, perms, markdown, use_tools):
     tools = TOOLS if use_tools else None
     total_in = total_out = 0
     start = time.time()
+    replied = auto_failed = retried = False
     for step in range(MAX_STEPS):
+        if replied and not auto_failed and compact_due(msgs):
+            r = compact_conv(conv, midway=True, auto=True)
+            if r == "cancelled":
+                return
+            auto_failed = r != "done"
         try:
             text, calls, usage = stream_and_render(conv["model"], msgs, tools, markdown)
         except KeyboardInterrupt as e:
@@ -1565,6 +1810,19 @@ def run_turn(conv, perms, markdown, use_tools):
                 msgs.append({"role": "assistant", "content": e.partial})
             return
         except RuntimeError as e:
+            if not retried and CONTEXT_FULL.search(str(e)) and not CANCEL.is_set():
+                retried = True          # the API says it's too long: compact and try again
+                if replied:
+                    r = compact_conv(conv, midway=True, auto=True)
+                else:                   # summarize what came before, then ask again
+                    user = msgs.pop()
+                    r = compact_conv(conv, auto=True)
+                    msgs.append(user)
+                    start_checkpoint(conv, len(msgs) - 1)
+                if r == "done":
+                    continue
+                if r == "cancelled":
+                    return
             err(f"tai: {e}")
             return
         if usage:
@@ -1580,6 +1838,7 @@ def run_turn(conv, perms, markdown, use_tools):
         elif not text:
             assistant["content"] = "(no response)"
         msgs.append(assistant)
+        replied = True
         if not calls:
             break
 
@@ -1653,6 +1912,10 @@ HELP = """Commands:
   /btw QUESTION   quick side question; answer is not added to the conversation
   /mode [name]    show or set permission mode (manual, accept-edits, auto)
   /usage          token usage this session
+  /compact [what to keep]  summarize the conversation to free up context (also automatic
+                  when the context window is 80% full)
+  /rewind [N]     go back to an earlier message and undo tai's file changes since then
+  /permissions    show the saved permission rules and where they are stored
   /help           this help                   /exit     quit (or Ctrl+C twice, or Ctrl+D)
 Alt+Enter inserts a new line (pasting multi-line text also works).
 Shift+Tab cycles the permission mode (manual → accept-edits → auto).
@@ -1660,7 +1923,8 @@ While tai works the prompt stays open: /btw QUESTION is answered right away, and
 message you type is read at tai's next step.
 Ctrl+C clears what you typed, then stops tai (queued messages come back); at an empty
 prompt with tai idle, twice quits.
-Approvals: 1 = yes, 2 = always this session (for web_fetch: that site), 3 = no."""
+Approvals: 1 = yes, 2 = don't ask again (saved for that command in this folder, or for
+that site; edits and other commands: this session), 3 = no."""
 
 
 def read_input(prompt):
@@ -1692,15 +1956,176 @@ def reset_system(conv):
 
 def ask(conv, perms, markdown, content):
     CANCEL.clear()
-    before = len(conv["messages"])
-    conv["messages"].append({"role": "user", "content": content})
+    msgs = conv["messages"]
+    user = {"role": "user", "content": content}
+    if compact_due(msgs + [user]) and compact_conv(conv, auto=True) == "cancelled":
+        return False
+    msgs.append(user)
+    start_checkpoint(conv, len(msgs) - 1)
     print()
     run_turn(conv, perms, markdown, conv["tools"])
-    if len(conv["messages"]) == before + 1:     # request failed before any reply: allow retry
-        conv["messages"].pop()
+    if msgs and msgs[-1] is user:               # request failed before any reply: allow retry
+        msgs.pop()
+        turns = conv.get("turns") or []
+        if turns and turns[-1]["msg"] == len(msgs):
+            turns.pop()
         return False
     save_conv(conv)
     return True
+
+
+# ---- checkpoints: the terminal remembers each file's content before a turn first changes it,
+# so /rewind can put files back (the editor server keeps its own, per session)
+CHECKPOINT = {"turn": None}
+CHECKPOINT_LOCK = threading.Lock()
+
+
+def start_checkpoint(conv, idx):
+    turn = {"msg": idx, "files": {}}
+    with CHECKPOINT_LOCK:
+        conv.setdefault("turns", []).append(turn)
+        CHECKPOINT["turn"] = turn
+
+
+def checkpoint_write(path, old):
+    with CHECKPOINT_LOCK:
+        turn = CHECKPOINT["turn"]
+        if turn is not None and str(path) not in turn["files"]:
+            turn["files"][str(path)] = snapshot(path)
+
+
+def rewind_files(turns, msg_index):
+    """Files changed in turns at or after msg_index, with the oldest snapshot of each."""
+    files = {}
+    for t in reversed(turns or []):
+        if t["msg"] >= msg_index:
+            files.update(t["files"])       # earlier turns overwrite: oldest snapshot wins
+    return files
+
+
+def is_note(m):
+    """Messages tai wrote itself (compaction summary, 'continue' note), not the user's."""
+    c = m.get("content")
+    return isinstance(c, str) and (c.startswith("[Summary of the earlier conversation]") or c == CONTINUE_NOTE)
+
+
+def visible_text(content):
+    """What the user typed, without attached files and piped input."""
+    if not isinstance(content, str):
+        content = text_of(content)
+    return re.sub(r"<file name=\"[^\"]*\">.*?</file>|<stdin>.*?</stdin>", "", content, flags=re.S).strip()
+
+
+def text_of(content):
+    if isinstance(content, list):
+        return "".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return content or ""
+
+
+def rewind_points(conv):
+    return [i for i, m in enumerate(conv["messages"]) if i and m.get("role") == "user" and not is_note(m)]
+
+
+def rewind(conv, arg):
+    """/rewind: list your messages; /rewind N [keep-files]: go back to the N-th latest one."""
+    points = rewind_points(conv)[::-1]
+    turns = conv.get("turns") or []
+    if not points:
+        dim("nothing to rewind yet")
+        return
+    words = arg.split()
+    if not words:
+        dim("Go back to one of your messages: the conversation after it is removed and tai's file")
+        dim("changes since then are undone. Your message comes back in the input to edit and resend.")
+        for n, i in enumerate(points[:15], 1):
+            files = rewind_files(turns, i)
+            extra = f"  · {len(files)} file{'s' if len(files) != 1 else ''} changed since" if files else ""
+            dim(f"  {n:>2}  {clip(visible_text(conv['messages'][i]['content']).replace(chr(10), ' '), 70)}{extra}")
+        dim("  /rewind N goes back to message N  ·  /rewind N keep-files leaves the files as they are")
+        return
+    if not words[0].isdigit() or not 1 <= int(words[0]) <= len(points) or \
+            any(w not in ("keep-files", "--keep-files") for w in words[1:]):
+        err(f"usage: /rewind N [keep-files], with N from 1 to {len(points)} (/rewind lists them)")
+        return
+    idx = points[int(words[0]) - 1]
+    msgs = conv["messages"]
+    text = visible_text(msgs[idx]["content"])
+    restored, failed = [], []
+    if len(words) == 1:
+        for path, snap in rewind_files(turns, idx).items():
+            try:
+                restore(Path(path), snap)
+                restored.append(show_path(Path(path)))
+            except (OSError, ValueError) as e:
+                failed.append(f"{show_path(Path(path))} ({e})")
+    del msgs[idx:]
+    conv["turns"] = [t for t in turns if t["msg"] < idx]
+    USAGE.ctx = 0
+    save_conv(conv)
+    if restored:
+        dim("  restored " + ", ".join(restored))
+    if failed:
+        err("  could not restore " + ", ".join(failed))
+    if LIVE.active:
+        LIVE.refill = text
+        dim("  rewound · your message is back in the input: edit it and press Enter")
+    else:
+        dim("  rewound · your message was:")
+        print(text)
+
+
+def quiet_reply(model, msgs, tools):
+    """A reply that is not shown (for the summary when compacting)."""
+    parts = []
+    gen = pumped(model, msgs, tools, CANCEL.is_set, "none" if tools else None)
+    try:
+        for kind, val in gen:
+            if kind == "text":
+                parts.append(val)
+            elif kind == "done":
+                calls, usage = val
+                USAGE.add(usage)
+                if calls:
+                    raise RuntimeError("the model tried to use tools instead of summarizing; try again")
+    except (RuntimeError, Cancelled):
+        raise
+    except Exception as e:
+        raise RuntimeError(f"connection lost: {e.__class__.__name__}: {e}") from None
+    finally:
+        gen.close()
+    return "".join(parts)
+
+
+def compact_conv(conv, instructions="", midway=False, auto=False):
+    """Replace the conversation with a summary. Returns "done", "cancelled" or "failed"."""
+    msgs = conv["messages"]
+    if not any(m.get("role") == "assistant" for m in msgs):
+        dim("nothing to compact yet")
+        return "failed"
+    before = context_estimate(msgs)
+    tools = TOOLS if conv["tools"] else None
+    if auto:
+        full = f" ({100 * before // USAGE.max_ctx}% full)" if USAGE.max_ctx else ""
+        say("")
+        dim(f"  the context window is almost full{full}: summarizing the conversation so far")
+    try:
+        with working("Compacting the conversation…"):
+            summary = summarize(lambda m: quiet_reply(conv["model"], m, tools), msgs, instructions, midway)
+    except (Cancelled, KeyboardInterrupt):
+        err("  [compacting interrupted · the conversation is unchanged]")
+        return "cancelled"
+    except RuntimeError as e:
+        err(f"tai: compacting failed: {e}")
+        return "failed"
+    msgs[:] = compacted_messages(msgs[0], summary, midway)
+    conv["turns"] = []
+    with CHECKPOINT_LOCK:
+        CHECKPOINT["turn"] = None
+    USAGE.ctx = est_tokens(json.dumps(msgs))
+    save_conv(conv)
+    dim(f"  conversation compacted · {human(before)} → {human(USAGE.ctx)} tokens"
+        + (" · tai continues" if midway else " · /save shows the summary"))
+    return "done"
 
 
 def btw(conv, markdown, question):
@@ -1732,6 +2157,9 @@ COMMANDS = [("/help", "show commands"), ("/model", "show or switch model"), ("/m
             ("/system", "show or set extra instructions"), ("/file", "attach a file to your next message"),
             ("/save", "save conversation as markdown"), ("/btw", "side question, not kept in the conversation"),
             ("/mode", "show or set permission mode (shift+tab cycles)"), ("/usage", "token usage this session"),
+            ("/compact", "summarize the conversation to free up context"),
+            ("/rewind", "go back to an earlier message (and undo file changes)"),
+            ("/permissions", "show saved permission rules"),
             ("/exit", "quit")]
 
 
@@ -1882,7 +2310,8 @@ def _readline_reader(state):
 
 
 def model_window(model):
-    """Look up the model's context window in the background (for the ctx % display)."""
+    """Look up the model's context window in the background (for the ctx % display and
+    automatic compacting)."""
     def look():
         try:
             for m in list_models():
@@ -1892,6 +2321,9 @@ def model_window(model):
             USAGE.max_ctx = None
         except Exception:
             pass
+        finally:
+            USAGE.window_known.set()
+    USAGE.window_known.clear()
     threading.Thread(target=look, daemon=True).start()
 
 
@@ -1905,7 +2337,8 @@ def stop_turn():
 
 
 # commands that make sense while tai is working (others change what the turn is working on)
-BUSY_OK = {"/btw", "/mode", "/usage", "/help", "/model", "/models", "/file", "/save", "/exit", "/quit", "/q"}
+BUSY_OK = {"/btw", "/mode", "/usage", "/help", "/model", "/models", "/file", "/save", "/permissions",
+           "/exit", "/quit", "/q"}
 
 
 def repl(conv, perms, markdown, pending=None):
@@ -1916,16 +2349,26 @@ def repl(conv, perms, markdown, pending=None):
     live = getattr(reader, "live", False)
     worker = None
 
-    def start(content):
-        """Run the turn, then any messages queued meanwhile; in the background when live."""
+    def start(content=None, job=None):
+        """Run the turn (or job, e.g. /compact), then any messages queued meanwhile; in the
+        background when live, so the prompt stays open."""
         nonlocal worker
         if not live:
-            ask(conv, perms, markdown, content)
+            job() if job else ask(conv, perms, markdown, content)
             return
 
         def run():
             c = content
             try:
+                if job:
+                    CANCEL.clear()
+                    job()
+                    with INBOX_LOCK:
+                        if not INBOX:
+                            LIVE.busy = False
+                            return
+                        c = "\n\n".join(INBOX)
+                        INBOX.clear()
                 while True:
                     ask(conv, perms, markdown, c)
                     with INBOX_LOCK:
@@ -2036,9 +2479,22 @@ def _repl_line(text, conv, perms, markdown, pending, start):
             dim(f"tools {'on (agent mode)' if conv['tools'] else 'off (chat mode)'}")
         elif cmd == "/clear":
             conv["messages"] = conv["messages"][:1]
+            conv["turns"] = []
             USAGE.ctx = 0
             pending.clear()
             dim("conversation cleared")
+        elif cmd == "/compact":
+            start(job=lambda: compact_conv(conv, arg))
+        elif cmd == "/rewind":
+            rewind(conv, arg)
+        elif cmd == "/permissions":
+            lines = SETTINGS.describe()
+            dim(f"mode: {perms.mode} — {MODE_INFO[perms.mode]}")
+            if perms.always:
+                dim("  allowed this session: " + ", ".join(sorted(perms.always)))
+            for line in lines or ["  no saved rules yet (answer 2 to an approval to save one)"]:
+                dim(line)
+            dim(f"  rules are saved in {SETTINGS.path} — edit it to add or remove them")
         elif cmd == "/system":
             if arg:
                 conv["extra_system"] = arg
@@ -2236,22 +2692,24 @@ class ServerPermissions(Permissions):
         self.proto = proto
 
     def check(self, kind, question, title="Permission", body=None, detail=None):
-        if CANCEL.is_set():
-            raise Denied("Cancelled.")
-        if kind in self.always or self.auto_ok(kind):
+        if self.preflight(kind, detail):
             return
-        detail = dict(detail or {})
+        always, remember = self.always_choice(kind, detail)
+        shown = dict(detail or {})
         for k in ("old", "new"):
-            if isinstance(detail.get(k), str) and len(detail[k]) > MAX_PREVIEW:
-                detail[k] = None
-                detail["tooLarge"] = True
-        always = "for this site" if kind.startswith("fetch:") else {
-            "edit": "for file edits", "bash": "for commands", "read": "for sensitive files"}.get(kind, "")
+            if isinstance(shown.get(k), str) and len(shown[k]) > MAX_PREVIEW:
+                shown[k] = None
+                shown["tooLarge"] = True
+
+        def settled():
+            try:
+                return CANCEL.is_set() or self.preflight(kind, detail)
+            except Denied:
+                return True
         res = self.proto.request("approval", {
             "kind": kind, "title": title, "question": question, "always": always,
-            "detail": detail, "agent": getattr(_tls, "label", "")},
-            abort=lambda: CANCEL.is_set() or kind in self.always or self.auto_ok(kind))
-        if kind in self.always or self.auto_ok(kind):
+            "detail": shown, "agent": getattr(_tls, "label", "")}, abort=settled)
+        if self.preflight(kind, detail):
             return                  # approved meanwhile ("always" in another card, or mode changed)
         if res is ABORTED or CANCEL.is_set():
             raise Denied("Cancelled.")
@@ -2259,7 +2717,7 @@ class ServerPermissions(Permissions):
             raise Denied("The editor did not answer the approval request.")
         decision = res.get("decision")
         if decision == "always":
-            self.always.add(kind)
+            remember()
             return
         if decision == "yes":
             return
@@ -2316,6 +2774,82 @@ def consistent_prefix(msgs):
     return out
 
 
+def _fraction(v, default=0.8):
+    v = str(v).strip().lower()
+    if v in ("0", "off", "no", "false"):
+        return 0.0
+    try:
+        f = float(v.rstrip("%"))
+    except ValueError:
+        return default
+    return f / 100 if f > 1 else f
+
+
+# Compacting: when the conversation nears the model's context window (TAI_AUTO_COMPACT,
+# default 80%; 0 turns it off), or the API says the request is too long, tai replaces the
+# conversation with a summary written by the model and carries on.
+COMPACT_AT = _fraction(os.environ.get("TAI_AUTO_COMPACT", "0.8"))
+CONTEXT_FULL = re.compile(r"context[ _-]?(length|window|limit)|maximum context|too many tokens|"
+                          r"prompt is too long|input is too long|reduce the length|token limit", re.I)
+COMPACT_ASK = ("Summarize our conversation so far so that the work can continue in a fresh context. "
+               "Include: the user's goals and requests, decisions made, files read or changed (paths), "
+               "important findings, the current state, and what remains to be done. Be complete but "
+               "concise; use markdown. Reply with the summary only.")
+COMPACT_MIDWAY = ("\n\nYou are in the middle of a task right now: say exactly what you are doing, which "
+                  "steps are done, and what the next step is, so that you can continue without the user.")
+CONTINUE_NOTE = ("[The conversation was summarized because the context window was nearly full. Continue "
+                 "the task you were working on from where you left off. Files may have changed since you "
+                 "last read them: read them again before editing.]")
+
+
+def context_estimate(msgs):
+    """Tokens the next request will send: the size at the last reply plus what came after it."""
+    last = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), default=None)
+    if last is None or not USAGE.ctx:
+        return est_tokens(json.dumps(msgs))
+    return USAGE.ctx + est_tokens(json.dumps(msgs[last + 1:]))
+
+
+def compact_due(msgs):
+    if not COMPACT_AT or not any(m.get("role") == "assistant" for m in msgs):
+        return False
+    USAGE.window_known.wait(5)      # the context window may still be being looked up
+    return bool(USAGE.max_ctx) and context_estimate(msgs) >= COMPACT_AT * USAGE.max_ctx
+
+
+def _shrunk(m):
+    c = m.get("content")
+    if m.get("role") in ("tool", "user") and isinstance(c, str) and len(c) > 4000:
+        return {**m, "content": c[:2500] + f"\n[... {len(c) - 3500} characters left out ...]\n" + c[-1000:]}
+    return m
+
+
+def summarize(reply, msgs, instructions="", midway=False):
+    """The model's summary of msgs. reply(messages) -> text. If the request itself is too long,
+    it is tried once more with long tool outputs and attachments cut down."""
+    ask = COMPACT_ASK + (COMPACT_MIDWAY if midway else "") + (f"\n\nAlso: {instructions}" if instructions else "")
+    base = consistent_prefix(list(msgs))
+    for shrink in (False, True):
+        req = ([base[0]] + [_shrunk(m) for m in base[1:]]) if shrink else base
+        try:
+            text = reply(req + [{"role": "user", "content": ask}])
+        except RuntimeError as e:
+            if not shrink and CONTEXT_FULL.search(str(e)):
+                continue
+            raise
+        if not text.strip():
+            raise RuntimeError("the model returned an empty summary")
+        return text.strip()
+
+
+def compacted_messages(system, summary, midway):
+    out = [system, {"role": "user", "content": "[Summary of the earlier conversation]\n\n" + summary},
+           {"role": "assistant", "content": "Understood. I'll continue from this summary."}]
+    if midway:
+        out.append({"role": "user", "content": CONTINUE_NOTE})
+    return out
+
+
 def clean_text(s):
     """Replaces lone UTF-16 surrogates (e.g. half an emoji cut off by a selection limit)."""
     s = str(s or "")
@@ -2364,10 +2898,10 @@ def session_path(sid):
     return SESSIONS / f"{sid}.json"
 
 
-def write_json_atomic(path, obj):
+def write_json_atomic(path, obj, indent=None):
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(obj), encoding="utf-8")
+    tmp = path.with_name(path.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(obj, indent=indent), encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -2512,6 +3046,8 @@ class Server:
             role = m.get("role")
             if role == "user":
                 d = disp.get(str(i)) or {}
+                if d.get("kind") == "hidden":
+                    continue
                 items.append({"type": "user", "index": i, "text": d.get("text", m.get("content") or ""),
                               "files": d.get("files") or [], "context": d.get("context") or "",
                               "kind": d.get("kind") or "", "time": d.get("time")})
@@ -2862,15 +3398,36 @@ class Server:
         def on_text(chunk):
             self.streaming_text += chunk
             self.proto.event("text", delta=chunk)
+        def compact(why_full):
+            """Compact before the next step. Before tai has replied, the new message is taken
+            out, the rest summarized, and the message added again; afterwards the summary
+            includes the task in progress."""
+            nonlocal idx
+            if not replied:
+                self.drop_user(idx)
+            ok = self.auto_compact(midway=replied)
+            if not replied:
+                idx = self.add_user(content, display, client_id)
+            return ok
         try:
-            step = 0
+            step, auto_failed, retried = 0, False, False
             while True:
                 if step >= MAX_STEPS:
                     reason = "max_steps"
                     break
                 step += 1
                 self.streaming_text = ""
-                text, calls, usage = self.stream(self.conv["model"], msgs, self.tools(), on_text=on_text)
+                if not auto_failed and compact_due(msgs):
+                    auto_failed = not compact(False)
+                try:
+                    text, calls, usage = self.stream(self.conv["model"], msgs, self.tools(), on_text=on_text)
+                except RuntimeError as e:
+                    if retried or not CONTEXT_FULL.search(str(e)) or self.streaming_text:
+                        raise
+                    retried = True          # the API says it's too long: compact and try again
+                    if not compact(True):
+                        raise
+                    continue
                 self.streaming_text = ""
                 if usage:
                     t_in += usage.get("prompt_tokens") or 0
@@ -2978,29 +3535,48 @@ class Server:
         self.emit_usage()
         self.proto.event("btw_end", id=bid, error=error)
 
-    def compact(self, instructions):
-        msgs = self.conv["messages"]
-        ask = ("Summarize our conversation so far so that the work can continue in a fresh context. "
-               "Include: the user's goals and requests, decisions made, files read or changed (paths), "
-               "important findings, the current state, and what remains to be done. Be complete but "
-               "concise; use markdown. Reply with the summary only." +
-               (f"\n\nAlso: {instructions}" if instructions else ""))
-        error, summary = None, ""
-        try:
-            summary, calls, _ = self.stream(self.conv["model"], consistent_prefix(msgs) + [
-                {"role": "user", "content": ask}], self.tools(), main=False, tool_choice="none")
+    def compact_now(self, instructions="", midway=False):
+        """Replace the conversation with the model's summary of it (in place). Raises
+        Cancelled or RuntimeError, leaving the conversation as it was."""
+        def reply(msgs):
+            text, calls, _ = self.stream(self.conv["model"], msgs, self.tools(), main=False,
+                                         tool_choice="none")
             if calls:
                 raise RuntimeError("the model tried to use tools instead of summarizing; try again")
-            if not summary.strip():
-                raise RuntimeError("the model returned an empty summary")
-            with self.lock:
-                before = sum(m.get("role") == "user" for m in msgs)
-                self.conv["messages"] = [msgs[0],
-                    {"role": "user", "content": "[Summary of the earlier conversation]\n\n" + summary},
-                    {"role": "assistant", "content": "Understood. I'll continue from this summary."}]
-                self.conv["display"] = {"1": {"text": summary, "kind": "summary", "time": time.time()}}
-                self.session["turns"] = []
-                USAGE.ctx = est_tokens(json.dumps(self.conv["messages"]))
+            return text
+        try:
+            summary = summarize(reply, self.conv["messages"], instructions, midway)
+        except Cancelled:
+            raise Cancelled() from None         # the partial summary is not a reply
+        with self.lock:
+            msgs = self.conv["messages"]
+            msgs[:] = compacted_messages(msgs[0], summary, midway)
+            self.conv["display"] = {"1": {"text": summary, "kind": "summary", "time": time.time()}}
+            if midway:
+                self.conv["display"]["3"] = {"kind": "hidden"}
+            self.session["turns"] = []
+            self.cur_turn = None
+            USAGE.ctx = est_tokens(json.dumps(msgs))
+
+    def auto_compact(self, midway):
+        """Compact during a turn; the editor shows it like /compact. Raises Cancelled."""
+        before = context_estimate(self.conv["messages"])
+        self.proto.event("auto_compact", phase="start")
+        error = "cancelled"
+        try:
+            self.compact_now("", midway)
+            error = None
+        except RuntimeError as e:
+            error = str(e)
+        finally:
+            self.proto.event("auto_compact", phase="end", error=error, before=before,
+                             after=USAGE.ctx if not error else None, usage=self.usage())
+        return error is None
+
+    def compact(self, instructions):
+        error = None
+        try:
+            self.compact_now(instructions)
             self.save()
         except Cancelled:
             error = "cancelled"
@@ -3068,6 +3644,10 @@ class Server:
             CANCEL.clear()
         threading.Thread(target=self.compact, args=(str(p.get("instructions") or ""),), daemon=True).start()
         return {}
+
+    def m_permissions(self, p):
+        """The settings file with the saved rules (created if missing), for the editor to open."""
+        return {"path": str(SETTINGS.ensure()), "rules": SETTINGS.describe()}
 
     def m_models(self, p):
         return {"models": [{"id": m["id"], "maxInput": m.get("max_input_tokens"),
@@ -3311,10 +3891,13 @@ def main():
         print_models(args.model or DEFAULT_MODEL)
         return
 
+    IO_HOOKS["before_write"] = checkpoint_write      # for /rewind
     conv = None
     if args.resume:
         try:
-            conv = json.loads(session_path(args.resume).read_text(encoding="utf-8"))["conv"]
+            sess = json.loads(session_path(args.resume).read_text(encoding="utf-8"))
+            conv = sess["conv"]
+            conv.setdefault("turns", sess.get("turns") or [])
             conv.setdefault("tools", True)
         except (OSError, ValueError, KeyError):
             sys.exit(f"tai: no saved session {args.resume}")
@@ -3357,6 +3940,8 @@ def main():
 
     if prompt or (piped and piped.strip()):
         content = "\n\n".join(attachments + ([prompt] if prompt else []))
+        if any(m.get("role") == "assistant" for m in conv["messages"]):
+            model_window(conv["model"])     # a continued conversation may need compacting
         ok = ask(conv, perms, markdown, content)
         if not args.interactive:
             sys.exit(0 if ok else 1)

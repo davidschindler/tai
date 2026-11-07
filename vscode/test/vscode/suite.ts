@@ -468,6 +468,16 @@ describe("tai extension", function () {
     assert.strictEqual(ext.sidebar.busy, false);
   });
 
+  it("/permissions opens the settings file with the saved rules", async () => {
+    const m = probe.mark();
+    await probe.webview({ type: "command", name: "permissions", arg: "" });
+    const doc = await until(() => vscode.window.visibleTextEditors.map((e) => e.document)
+      .find((d) => d.fileName.endsWith("settings.json")), 10000, "settings editor");
+    assert.deepStrictEqual(JSON.parse(doc.getText()).allow, { commands: [], sites: [] });
+    assert.match((await until(() => probe.since(m, "notice")[0], 5000, "notice")).text, /No saved rules yet/);
+    await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+  });
+
   it("exports the conversation with /save", async () => {
     await probe.webview({ type: "command", name: "save", arg: "export.md" });
     assert.match(fs.readFileSync(path.join(WS, "export.md"), "utf8"), /## You/);

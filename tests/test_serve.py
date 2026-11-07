@@ -85,7 +85,7 @@ def test_edit_approval_yes_gives_diff(client):
     req = [x for x in c.of("_request", m) if x["method"] == "approval"][0]["params"]
     assert req["kind"] == "edit" and req["detail"]["type"] == "edit"
     assert req["detail"]["old"] == "x = 1\n" and req["detail"]["new"] == "x = 2\n"
-    assert req["always"] == "for file edits"
+    assert req["always"] == "for file edits this session"
     assert f.read_text() == "x = 2\n"
     te = c.wait("tool_end", start=m)
     assert te["diff"]["old"] == "x = 1\n" and te["diff"]["new"] == "x = 2\n"
@@ -157,7 +157,7 @@ def test_fetch_approval_is_per_site(client):
     _, end, m = c.send(mock({"tools": [{"name": "web_fetch", "args": {"url": "https://example.invalid/x"}}]},
                             {"text": "k"}))
     req = [x for x in c.of("_request", m) if x["method"] == "approval"][0]["params"]
-    assert req["kind"] == "fetch:example.invalid" and req["always"] == "for this site"
+    assert req["kind"] == "fetch:example.invalid" and req["always"] == "for example.invalid"
     assert req["detail"] == {"type": "fetch", "url": "https://example.invalid/x", "host": "example.invalid"}
 
 

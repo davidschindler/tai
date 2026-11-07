@@ -68,7 +68,9 @@ export type TaiEvent =
   | { type: "request_cancelled"; requestId: string }
   | { type: "btw_text"; id: string; delta: string }
   | { type: "btw_end"; id: string; error: string | null }
-  | { type: "compact_end"; error: string | null; transcript: TranscriptItem[] | null; usage: Usage };
+  | { type: "compact_end"; error: string | null; transcript: TranscriptItem[] | null; usage: Usage }
+  | { type: "auto_compact"; phase: "start" } | { type: "auto_compact"; phase: "end"; error: string | null;
+      before: number; after: number | null; usage: Usage };
 
 export interface ApprovalParams {
   kind: string;

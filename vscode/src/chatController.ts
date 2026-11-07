@@ -852,6 +852,13 @@ export class ChatController implements vscode.Disposable {
         return this.openTerminal();
       case "restart":
         return this.restart();
+      case "permissions": {
+        const r = await c.call("permissions", {}, 10000);
+        await vscode.window.showTextDocument(vscode.Uri.file(r.path), { preview: false });
+        return this.notice("info", (r.rules.length ? "Saved rules: " + r.rules.map((x: string) => x.trim()).join("; ") + "." : "No saved rules yet.") +
+          " Answering “don't ask again” to a command or site adds one; edit the file to add or remove rules " +
+          "(`deny` rules block even in auto mode).");
+      }
       case "rewind": {
         const t = await c.call("transcript", {}, 10000);
         const users = (t.transcript as TranscriptItem[]).filter((i): i is Extract<TranscriptItem, { type: "user" }> =>

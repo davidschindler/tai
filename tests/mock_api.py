@@ -6,6 +6,8 @@ element scripts one assistant reply after that message (the n-th reply after the
 element n):
     {"text": "...", "tools": [{"name": "read_file", "args": {...}}], "delay": 0.2,
      "chunk_delay": 0.01, "error": 500, "hang": 30}
+A conversation mentioning SLOW_SUMMARY makes summary requests (compacting) take 30 s.
+Model "mock-window" refuses requests over 3000 tokens (characters / 4), like a full context window.
 When the script is used up, or there is no script, the model replies "Echo: <message text>".
 GET /_log returns every chat request received; POST /_reset clears it.
 
@@ -17,10 +19,12 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+LIMITS = {"mock-window": 3000}     # requests above this many tokens (chars / 4) are refused
 LOG = []
 LOCK = threading.Lock()
 MODELS = [{"id": "gpt-5.6-sol", "max_input_tokens": 400000, "mode": "chat"},
           {"id": "mock-small", "max_input_tokens": 1000, "mode": "chat"},
+          {"id": "mock-window", "max_input_tokens": 3000, "mode": "chat"},   # enforced, see LIMITS
           {"id": "text-embedding-3", "mode": "embedding"}]
 
 
@@ -113,7 +117,15 @@ class H(BaseHTTPRequestHandler):
         problem = validate(payload.get("messages") or [])
         if problem:     # like the real API: a broken conversation is rejected
             return self._json({"error": {"message": problem}}, 400)
-        step, _ = script_step(payload.get("messages") or [])
+        limit = LIMITS.get(payload.get("model"))
+        size = len(json.dumps(payload.get("messages"))) // 4
+        if limit and size > limit:
+            return self._json({"error": {"message": f"This model's maximum context length is {limit} tokens. "
+                                                    f"However, your messages resulted in {size} tokens."}}, 400)
+        msgs = payload.get("messages") or []
+        if "SLOW_SUMMARY" in json.dumps(msgs) and "Summarize our conversation" in str(msgs[-1].get("content")):
+            time.sleep(30)          # a summary that takes long (to test cancelling it)
+        step, _ = script_step(msgs)
         if payload.get("tool_choice") == "none":
             step = {k: v for k, v in step.items() if k != "tools"}
         if step.get("delay"):

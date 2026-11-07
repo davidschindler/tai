@@ -40,6 +40,12 @@ def term(api, tmp_path):
             p.terminate(force=True)
 
 
+def done(p):
+    """Wait for the end of a turn (its stats line), then the prompt."""
+    p.expect(r"out · \d+s", timeout=15)
+    p.expect(PROMPT)
+
+
 def busy(p):
     """Wait until the running turn shows its status line above the prompt."""
     p.expect("ctrl\\+c to interrupt")
@@ -210,4 +216,81 @@ def test_classic_session_still_works(term):
     p.expect("mode: manual")
     p.expect(PROMPT)
     p.sendcontrol("d")
+    p.expect(pexpect.EOF)
+
+
+def test_compact_command(term):
+    p = term()
+    p.sendline(mock({"text": "FIRST ANSWER"}))
+    done(p)
+    p.sendline("/compact keep the numbers")
+    p.expect("conversation compacted", timeout=15)
+    p.expect(PROMPT)
+    p.sendline("/save conv.md")
+    p.expect("saved to")
+    text = (p.ws / "conv.md").read_text()
+    assert "[Summary of the earlier conversation]" in text and "FIRST ANSWER" not in text
+    p.sendline("/exit")
+    p.expect(pexpect.EOF)
+
+
+def test_rewind_lists_restores_files_and_refills_the_input(term):
+    p = term("--auto")
+    f = p.ws / "doc.txt"
+    f.write_text("v0\n")
+    edit = lambda o, n: {"name": "edit_file", "args": {"path": "doc.txt", "old_string": o, "new_string": n}}
+    p.sendline("first " + mock({"tools": [edit("v0", "v1")]}, {"text": "ONE DONE"}))
+    done(p)
+    p.sendline("second " + mock({"tools": [edit("v1", "v2")]}, {"text": "TWO DONE"}))
+    done(p)
+    assert f.read_text() == "v2\n"
+    p.sendline("/rewind")
+    p.expect("1  second")
+    p.expect("1 file changed since")
+    p.expect("2  first")
+    p.expect(PROMPT)
+    p.sendline("/rewind 1")
+    p.expect("restored doc.txt")
+    p.expect("back in the input")
+    assert f.read_text() == "v1\n"
+    p.sendcontrol("u")                       # clear the refilled text, type something else
+    p.sendline("/rewind 1 keep-files")       # now 'first' is the latest message
+    p.expect("back in the input")
+    assert f.read_text() == "v1\n"
+    p.sendcontrol("e")
+    p.sendline("")                           # Enter resends the refilled message (auto mode)
+    p.expect("old_string not found")         # v0 → v1 again: the file is still v1 (keep-files)
+    done(p)
+    assert f.read_text() == "v1\n"
+    p.sendline("/exit")
+    p.expect(pexpect.EOF)
+
+
+def test_approval_2_saves_a_rule_shown_by_permissions(term):
+    p = term()
+    p.sendline(mock({"tools": [{"name": SHELL, "args": {"command": "echo saved-rule"}}]}, {"text": "RAN"}))
+    p.expect("don't ask again for `echo` commands in this folder")
+    p.sendline("2")
+    done(p)
+    p.sendline("/permissions")
+    p.expect("allow commands: echo")
+    p.expect("settings.json")
+    p.sendline(mock({"tools": [{"name": SHELL, "args": {"command": "echo again"}}]}, {"text": "NO QUESTION"}))
+    i = p.expect([r"out · \d+s", "1 yes · 2 always"])
+    assert i == 0, "the saved rule did not apply"
+    p.sendline("/exit")
+    p.expect(pexpect.EOF)
+
+
+def test_auto_compact_in_a_live_session(term):
+    p = term("--auto", "-m", "mock-window")
+    (p.ws / "big.txt").write_text("lorem ipsum dolor sit amet\n" * 230)
+    p.sendline("hello")
+    done(p)
+    p.sendline(mock({"tools": [{"name": "read_file", "args": {"path": "big.txt"}}]}))
+    p.expect("context window is almost full", timeout=15)
+    p.expect("tai continues", timeout=15)
+    p.expect("Echo: \\[The conversation was summarized")
+    done(p)
+    p.sendline("/exit")
     p.expect(pexpect.EOF)

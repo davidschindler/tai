@@ -43,8 +43,19 @@ tai
 ## Using it
 
 - **Approvals:** file edits, commands and web page fetches ask first: *1* yes, *2* yes and don't ask again, *3* no (and tell tai what to do instead). `Shift+Tab` switches between *manual*, *accept edits* and *auto*.
-- `@file` attaches a file, `/` lists commands (`/btw` for a side question, `/model`, `/compact`, `/rewind`, …), `Esc` stops tai (`Ctrl+C` in the terminal).
+- **Saved permissions:** *2* on a command such as `git status` or `pytest` remembers it for that folder, and on a web page for that site, also in later sessions. `/permissions` shows the rules and the file they are kept in (`settings.json` next to the saved conversations). You can edit it, including `deny` rules that block a command or site even in auto mode:
+  ```json
+  {
+    "allow":   {"commands": ["git status", "git diff"], "sites": ["docs.python.org"]},
+    "deny":    {"commands": ["git push", "rm -rf"], "sites": []},
+    "folders": {"/path/to/project": {"allow": {"commands": ["make test"]}}}
+  }
+  ```
+  A command rule covers commands that start with those words; an allow rule never covers commands chained with `;`, `&&`, `|`, `>` and the like.
+- `@file` attaches a file, `/` lists commands (`/btw` for a side question, `/model`, `/compact`, `/rewind`, `/permissions`, …), `Esc` stops tai (`Ctrl+C` in the terminal).
 - **While tai works** you can keep typing: `/btw QUESTION` is answered right away without disturbing the task, and a normal message is read at tai's next step.
+- **Long conversations:** when the context window is 80% full, tai summarizes the conversation so far and carries on, also in the middle of a task (`/compact` does it on request; set `TAI_AUTO_COMPACT=0` to turn the automatic one off).
+- **Going back:** `/rewind` returns to one of your earlier messages and undoes the file changes tai made since then; the message comes back in the input to edit and resend.
 - Commands run in **bash** on macOS/Linux and in **PowerShell** on Windows.
 - Conversations are saved locally (`%LOCALAPPDATA%\tai` on Windows, `~/.local/state/tai` elsewhere). `tai -c` continues the last one.
 

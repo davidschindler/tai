@@ -99,7 +99,7 @@ export class Harness {
   }
 
   /** Starts tai --serve with the real TaiClient and forwards like ChatController. */
-  async startTai({ mode = "manual" } = {}) {
+  async startTai({ mode = "manual", model } = {}) {
     const env = { ...process.env, TAI_API_BASE: this.api, TILBURG_AI_API_KEY: "test-key", XDG_STATE_HOME: this.state };
     const c = (this.client = new TaiClient({ executable: TAI, python: TAI.endsWith(".py") ? PYTHON : undefined, cwd: this.ws, env, log: () => {} }));
     c.onEvent((e) => this.post({ type: "event", event: e }));
@@ -122,7 +122,7 @@ export class Harness {
       }
     });
     await c.start();
-    const init = await c.call("initialize", { ide: true, mode });
+    const init = await c.call("initialize", { ide: true, mode, ...(model ? { model } : {}) });
     this.post({ type: "status", status: "ready" });
     this.post({ type: "init", state: init.state, settings: { ctrlEnterToSend: false, attachOpenFile: true, showTimestamps: false },
       version: init.version, cwd: this.ws, modeInfo: init.modeInfo });

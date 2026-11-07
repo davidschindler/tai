@@ -319,6 +319,26 @@ describe("webview", { concurrency: false }, () => {
     await done(h);
   });
 
+  it("shows when tai compacts on its own in the middle of a task", async () => {
+    const h = await harness({ mode: "auto", model: "mock-window" });     // a 3000-token window
+    fs.writeFileSync(path.join(h.ws, "big.txt"), "lorem ipsum dolor sit amet\n".repeat(230));
+    await h.sendText("hello");
+    await h.waitIdle();
+    assert.equal(await h.page.$$eval(".msg.user .rewind", (b) => b.length), 1);
+    await h.sendText(mock({ tools: [{ name: "read_file", args: { path: "big.txt" } }] }));
+    await h.page.waitForFunction(() => [...document.querySelectorAll(".notice")]
+      .some((n) => n.textContent.includes("context window was nearly full")), { timeout: 15000 });
+    await h.waitIdle();
+    await h.page.waitForFunction(() => document.body.textContent.includes("Echo: [The conversation was summarized"));
+    // messages from before the summary can't be rewound to; the ones after can
+    assert.equal(await h.page.$$eval(".msg.user[data-index]", (b) => b.length), 0);
+    assert.equal(await h.page.$$eval(".msg.user .rewind", (b) => b.length), 0);
+    await h.sendText("after");
+    await h.waitIdle();
+    assert.deepEqual(await h.page.$$eval(".msg.user[data-index]", (b) => b.map((x) => x.dataset.index)), ["5"]);
+    await done(h);
+  });
+
   it("status banner appears and disappears (starting → ready → stopped → restart)", async () => {
     const h = await harness();
     const visible = () => h.page.$eval("#banner", (b) => getComputedStyle(b).display !== "none");
