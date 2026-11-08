@@ -13,7 +13,7 @@
 Tools: read/list/grep files and web_search run on their own. Editing files,
 running commands and fetching web pages (per site) ask for approval first.
 The agent can start sub-agents (task tool), which run in parallel.
-Shift+Tab (or /mode) cycles the permission mode: manual → accept-edits → auto.
+Shift+Tab (or /mode) cycles the permission mode: manual → accept-edits → auto → plan.
 /btw asks a side question that is not kept in the conversation.
 
 Key: $TILBURG_AI_API_KEY, or store one with `tai --set-key`.
@@ -233,10 +233,11 @@ class Usage:
 USAGE = Usage()
 
 # Permission modes, cycled with Shift+Tab or /mode.
-MODES = ["manual", "accept-edits", "auto"]
+MODES = ["manual", "accept-edits", "auto", "plan"]
 MODE_INFO = {"manual": "asks before edits, commands and fetches",
              "accept-edits": "file edits run without asking",
-             "auto": "edits, commands and fetches run without asking (secret files still ask)"}
+             "auto": "edits, commands and fetches run without asking (secret files still ask)",
+             "plan": "tai only reads and makes a plan; nothing changes until you approve the plan"}
 
 
 def mode_info():
@@ -867,10 +868,16 @@ class Permissions:
     def __init__(self, mode="manual"):
         self.mode = mode
         self.always = set()
+        self.on_mode = None             # called when tai itself changes the mode (plan approved)
 
     def cycle(self):
         self.mode = MODES[(MODES.index(self.mode) + 1) % len(MODES)]
         return self.mode
+
+    def set_mode(self, mode):
+        self.mode = mode
+        if self.on_mode:
+            self.on_mode(mode)
 
     def auto_ok(self, kind, detail=None):
         detail = detail or {}
@@ -888,6 +895,9 @@ class Permissions:
         request is already allowed (this session, the mode, or a saved rule)."""
         if CANCEL.is_set():
             raise Denied("Cancelled.")
+        if self.mode == "plan" and kind in ("edit", "bash"):
+            raise ToolError("plan mode is on: tai changes nothing until the user approves a plan; "
+                            "finish the plan and present it with present_plan")
         rule = SETTINGS.denied(kind, detail)
         if rule:
             raise Blocked(rule)
@@ -904,6 +914,8 @@ class Permissions:
         if kind.startswith("fetch:"):
             host = kind[6:]
             return f"for {host}", lambda: self._save("sites", host, None, kind)
+        if kind == "plan":
+            return "", lambda: self.set_mode("accept-edits")
         text = {"edit": "for file edits this session", "read": "for sensitive files this session"}.get(
             kind, "this session")
         return text, lambda: self.always.add(kind)
@@ -932,14 +944,16 @@ class Permissions:
             return
         label = getattr(_tls, "label", "")
         always, remember = self.always_choice(kind, detail)
+        notify_waiting()
+        yes, yes2, no = choice_labels(kind, always)
         if RICH:
             items = []
             if body is not None:
                 items += [body, Text("")]
             items += [Text(question, style="bold"),
-                      Text.assemble(("  1. ", GOLD), "Yes"),
-                      Text.assemble(("  2. ", GOLD), f"Yes, and don't ask again {always}"),
-                      Text.assemble(("  3. ", GOLD), "No, and tell tai what to do differently")]
+                      Text.assemble(("  1. ", GOLD), yes),
+                      Text.assemble(("  2. ", GOLD), yes2),
+                      Text.assemble(("  3. ", GOLD), no)]
             ttl = Text.assemble((f" {label} › " if label else " ", GREY), (title + " ", f"bold {GOLD}"))
             with IO:
                 console.print(Panel(Group(*items), title=ttl, title_align="left", box=box.ROUNDED,
@@ -965,10 +979,90 @@ class Permissions:
         if ans in ("1", "y", "yes"):
             return
         try:
-            why = ask_line("  What should tai do instead? (Enter to skip) ❯ ").strip()
+            why = ask_line("  What should tai change in the plan? (Enter to skip) ❯ " if kind == "plan" else
+                           "  What should tai do instead? (Enter to skip) ❯ ").strip()
         except EOFError:
             why = ""
         raise Denied(why)
+
+
+def choice_labels(kind, always):
+    """The three answers to an approval question."""
+    if kind == "plan":
+        return ("Yes, start (file edits and commands still ask)", "Yes, and let file edits run without asking",
+                "No, keep planning, and tell tai what to change")
+    return "Yes", f"Yes, and don't ask again {always}".strip(), "No, and tell tai what to do differently"
+
+
+# ================================================================ notifications
+# After a long turn (and when an approval waits after one), the terminal rings its bell;
+# settings.json "notify": "desktop" also shows a desktop notification, "off" turns it off.
+NOTIFY_AFTER = 30                   # seconds
+TURN_CLOCK = {"start": None}
+WIN_TOAST = r"""$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$t = $x.GetElementsByTagName('text')
+$t.Item(0).AppendChild($x.CreateTextNode($env:TAI_NOTIFY_TITLE)) | Out-Null
+$t.Item(1).AppendChild($x.CreateTextNode($env:TAI_NOTIFY_BODY)) | Out-Null
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($x))"""
+
+
+def notify_setting():
+    v = SETTINGS.load().get("notify", "bell")
+    return v if v in ("bell", "desktop", "off") else "bell"
+
+
+def desktop_notify(title, body):
+    """Show a desktop notification (macOS, Windows, Linux with notify-send). False if it can't."""
+    env = None
+    if sys.platform == "darwin":
+        q = lambda x: json.dumps(x, ensure_ascii=False)
+        argv = ["osascript", "-e", f"display notification {q(body)} with title {q(title)}"]
+    elif WINDOWS:
+        argv = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WIN_TOAST]
+        env = {**os.environ, "TAI_NOTIFY_TITLE": title, "TAI_NOTIFY_BODY": body}
+    else:
+        exe = shutil.which("notify-send")
+        if not exe:
+            return False
+        argv = [exe, "-a", "tai", title, body]
+    try:
+        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, env=env, **NO_WINDOW)
+        return True
+    except OSError:
+        return False
+
+
+def notify_user(what):
+    mode = notify_setting()
+    if mode == "off":
+        return
+    out = sys.__stdout__
+    if out is not None and out.isatty():
+        try:
+            out.write("\a")
+            out.flush()
+        except (OSError, ValueError):
+            pass
+    if mode == "desktop":
+        desktop_notify("tai", f"{what} · {Path.cwd().name}")
+
+
+def notify_done():
+    start, TURN_CLOCK["start"] = TURN_CLOCK["start"], None
+    if start and time.time() - start >= NOTIFY_AFTER:
+        notify_user("tai has finished")
+
+
+def notify_waiting():
+    """An approval question: ring if the turn has been running a while (then not again soon)."""
+    start = TURN_CLOCK["start"]
+    if start and time.time() - start >= NOTIFY_AFTER:
+        TURN_CLOCK["start"] = time.time()
+        notify_user("tai is waiting for your approval")
 
 
 # ================================================================ file tools
@@ -1058,9 +1152,11 @@ def tool_read_file(a, perms):
         part, size = image_file_part(path)
         return ([{"type": "text", "text": f"The image {show_path(path)} ({human(size)}B):"}, part],
                 f"Read image ({human(size)}B)")
-    if path.is_file() and path.suffix.lower() == ".pdf":
-        text = pdf_to_text(path.read_bytes())
-        lines = text.splitlines()
+    images = []
+    if path.is_file() and path.suffix.lower() == ".ipynb":
+        lines, images = notebook_view(path)
+    elif path.is_file() and path.suffix.lower() in DOC_TYPES:
+        lines = document_text(path).splitlines()
     else:
         if path.is_file() and is_binary(path):
             raise ToolError(f"{show_path(path)} is a binary file")
@@ -1072,7 +1168,16 @@ def tool_read_file(a, perms):
     more = len(lines) - (start - 1 + len(chunk))
     if more > 0:
         body += f"\n[... {more} more lines; use offset={start + len(chunk)} to continue]"
-    return body or "(empty file)", f"Read {len(chunk)} lines"
+    shown = [(i, cell, part) for i, cell, part in images if start - 1 <= i < start - 1 + len(chunk)]
+    if not shown:
+        return body or "(empty file)", f"Read {len(chunk)} lines"
+    content = [{"type": "text", "text": body}]
+    for k, (i, cell, part) in enumerate(shown[:NB_IMAGES]):
+        content += [{"type": "text", "text": f"[{lines[i][1:-1]}, output of cell {cell}]:"}, part]
+    if len(shown) > NB_IMAGES:
+        content.append({"type": "text", "text": f"[{len(shown) - NB_IMAGES} more images not shown; read "
+                                                "a smaller range with offset/limit to see them]"})
+    return content, f"Read {len(chunk)} lines, {min(len(shown), NB_IMAGES)} images"
 
 
 def walk_files(base, name_glob=None):
@@ -1181,15 +1286,15 @@ def diff_view(old, new, label, max_lines=120):
     return Group(*out)
 
 
-def write_after_approval(path, old, new, perms, verb):
+def write_after_approval(path, old, new, perms, verb, body=None):
     label = show_path(path)
     if old is not None and old == new:
         raise ToolError("the new content is identical to the current file")
     detail = {"type": "edit", "path": str(path), "old": old, "new": new}
     if old is None:
-        perms.check("edit", f"Create {label}?", "Create file", diff_view(None, new, label), detail=detail)
+        perms.check("edit", f"Create {label}?", "Create file", body or diff_view(None, new, label), detail=detail)
     else:
-        perms.check("edit", f"{verb} {label}?", "Edit file", diff_view(old, new, label), detail=detail)
+        perms.check("edit", f"{verb} {label}?", "Edit file", body or diff_view(old, new, label), detail=detail)
     try:
         now = read_text(path) if path.exists() else None
     except ToolError:
@@ -1217,6 +1322,8 @@ def tool_write_file(a, perms):
 
 def tool_edit_file(a, perms):
     path = resolve(a["path"])
+    if path.suffix.lower() == ".ipynb":
+        raise ToolError("this is a Jupyter notebook: change it with edit_notebook")
     old = read_text(path)
     find, repl = a["old_string"], a["new_string"]
     count = old.count(find) if find else 0
@@ -1767,6 +1874,774 @@ def pdf_to_text(data):
     return r.stdout
 
 
+# ================================================================ documents
+# read_file and attachments show Word, Excel, PowerPoint and Stata files and Jupyter notebooks
+# as text, with the standard library only: Office files are zip files of XML, and the .dta
+# format is documented by Stata. Notebook plots are shown to the model as images.
+MAX_XML = 200_000_000           # bytes unpacked from one part of an Office file (zip bombs)
+MAX_SHEET_ROWS = 20_000         # rows shown per worksheet
+DTA_ROWS = 20                   # observations shown from a Stata file
+NB_OUTPUT = 4000                # characters shown per notebook output
+NB_IMAGES = 8                   # plots shown per read_file of a notebook
+DOC_TYPES = {".pdf", ".docx", ".xlsx", ".xlsm", ".pptx", ".dta", ".ipynb"}
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def document_text(path):
+    """The text of a PDF, Word, Excel, PowerPoint, Stata or notebook file; None for other files."""
+    ext = path.suffix.lower()
+    if ext not in DOC_TYPES or not path.is_file():
+        return None
+    if ext == ".pdf":
+        return pdf_to_text(path.read_bytes())
+    if ext == ".ipynb":
+        return "\n".join(notebook_view(path)[0])
+    import struct
+    import zipfile
+    import xml.etree.ElementTree as ET
+    read = {".docx": docx_text, ".xlsx": xlsx_text, ".xlsm": xlsx_text, ".pptx": pptx_text,
+            ".dta": dta_text}[ext]
+    try:
+        return "\n".join(_wrap_long(read(path)))
+    except zipfile.BadZipFile:
+        raise ToolError(f"{show_path(path)} is not a valid {ext[1:]} file (is it password-protected?)")
+    except (ET.ParseError, struct.error, KeyError, IndexError, ValueError, EOFError) as e:
+        raise ToolError(f"cannot read {show_path(path)}: the file looks damaged ({e})")
+
+
+def _wrap_long(lines, width=1500):
+    """read_file cuts lines at 2000 characters: split long paragraphs at spaces instead."""
+    for line in lines:
+        while len(line) > width:
+            cut = line.rfind(" ", 0, width)
+            cut = cut if cut > width // 2 else width
+            yield line[:cut]
+            line = line[cut:].lstrip()
+        yield line
+
+
+def _local(tag):
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def _attr(el, name):
+    for k, v in el.attrib.items():
+        if _local(k) == name:
+            return v
+    return None
+
+
+def _rid(el):
+    """The r:id attribute (a relationship id), not a plain id."""
+    return next((v for k, v in el.attrib.items() if k.endswith("}id")), None)
+
+
+def _zip_xml(z, name):
+    import xml.etree.ElementTree as ET
+    try:
+        info = z.getinfo(name)
+    except KeyError:
+        return None
+    if info.file_size > MAX_XML:
+        raise ToolError(f"{name} in this file is too large to read")
+    return ET.fromstring(z.read(name))
+
+
+def _rels(z, name, base):
+    """Relationship id -> part name, from a .rels file of an Office document."""
+    import posixpath
+    x = _zip_xml(z, name)
+    out = {}
+    for r in (x if x is not None else []):
+        t, rid = _attr(r, "Target") or "", _attr(r, "Id")
+        if _attr(r, "TargetMode") == "External":
+            continue
+        out[rid] = t[1:] if t.startswith("/") else posixpath.normpath(posixpath.join(base, t))
+        out[rid + ":type"] = _attr(r, "Type") or ""
+    return out
+
+
+def _open_zip(path):
+    import zipfile
+    return zipfile.ZipFile(path)
+
+
+# ---- Word
+def _docx_para(p):
+    out = []
+    for e in p.iter():
+        t = _local(e.tag)
+        if t == "t":
+            out.append(e.text or "")
+        elif t == "tab":
+            out.append("\t")
+        elif t in ("br", "cr"):
+            out.append(" ")
+        elif t in ("footnoteReference", "endnoteReference"):
+            out.append(f"[^{'' if t[0] == 'f' else 'e'}{_attr(e, 'id')}]")
+    text = "".join(out).strip()
+    style = list_item = None
+    for e in p:
+        if _local(e.tag) == "pPr":
+            for s in e:
+                if _local(s.tag) == "pStyle":
+                    style = _attr(s, "val") or ""
+                elif _local(s.tag) == "numPr":
+                    list_item = True
+    if text and style:
+        m = re.search(r"(?i)(heading|berschrift|kop|titre)\s*(\d)", style)
+        if m:
+            return "#" * min(int(m.group(2)), 6) + " " + text
+        if style.lower() in ("title", "titel"):
+            return "# " + text
+        if style.lower().startswith(("list", "lijst", "aufz")):
+            list_item = True
+    return ("- " + text) if (text and list_item) else text
+
+
+def _docx_table(tbl):
+    rows = []
+    for tr in tbl:
+        if _local(tr.tag) != "tr":
+            continue
+        cells = []
+        for tc in tr:
+            if _local(tc.tag) == "tc":
+                cells.append(" / ".join(x for x in (_docx_para(p) for p in tc.iter() if _local(p.tag) == "p") if x))
+        rows.append("| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |")
+    return rows
+
+
+def _docx_blocks(parent, out):
+    for el in parent:
+        t = _local(el.tag)
+        if t == "p":
+            out.append(_docx_para(el))
+        elif t == "tbl":
+            out.extend(_docx_table(el))
+            out.append("")
+        elif t in ("sdt", "sdtContent", "customXml"):
+            _docx_blocks(el, out)
+
+
+def docx_text(path):
+    with _open_zip(path) as z:
+        doc = _zip_xml(z, "word/document.xml")
+        if doc is None:
+            raise ToolError(f"{show_path(path)} is not a Word document")
+        body = next((e for e in doc if _local(e.tag) == "body"), doc)
+        out = []
+        _docx_blocks(body, out)
+        for part, label in (("word/footnotes.xml", "^"), ("word/endnotes.xml", "^e")):
+            x = _zip_xml(z, part)
+            if x is None:
+                continue
+            notes = []
+            for n in x:
+                if _local(n.tag) not in ("footnote", "endnote") or (_attr(n, "type") or "normal") != "normal":
+                    continue
+                text = " ".join(t for t in (_docx_para(p) for p in n.iter() if _local(p.tag) == "p") if t)
+                if text:
+                    notes.append(f"[{label}{_attr(n, 'id')}] {text}")
+            if notes:
+                out += ["", "Footnotes:" if label == "^" else "Endnotes:"] + notes
+    lines = []
+    for l in out:                   # at most one empty line in a row
+        if l or (lines and lines[-1]):
+            lines.append(l)
+    return lines or ["(no text)"]
+
+
+# ---- Excel
+def _col_number(ref):
+    n = 0
+    for ch in ref:
+        if not ch.isalpha():
+            break
+        n = n * 26 + ord(ch.upper()) - 64
+    return n
+
+
+def _is_date_format(code):
+    code = re.sub(r'"[^"]*"|\[[^\]]*\]|\\.', "", code or "")
+    return bool(re.search(r"[dmyhs]", code, re.I)) and "General" not in code
+
+
+def _number(v):
+    try:
+        x = float(v)
+    except ValueError:
+        return v
+    return str(int(x)) if x.is_integer() and abs(x) < 1e15 else f"{x:.15g}"
+
+
+def _excel_date(v, date1904):
+    try:
+        x = float(v)
+    except ValueError:
+        return v
+    base = datetime.datetime(1904, 1, 1) if date1904 else datetime.datetime(1899, 12, 30)
+    try:
+        d = base + datetime.timedelta(seconds=round(x * 86400))
+    except OverflowError:
+        return v
+    if d.hour or d.minute or d.second:
+        return d.strftime("%Y-%m-%d %H:%M" if not d.second else "%Y-%m-%d %H:%M:%S")
+    return d.strftime("%Y-%m-%d")
+
+
+def _si_text(si):
+    out = []
+    for e in si:
+        t = _local(e.tag)
+        if t == "t":
+            out.append(e.text or "")
+        elif t == "r":
+            out += [x.text or "" for x in e if _local(x.tag) == "t"]
+    return "".join(out)
+
+
+def xlsx_text(path):
+    import xml.etree.ElementTree as ET
+    with _open_zip(path) as z:
+        wb = _zip_xml(z, "xl/workbook.xml")
+        if wb is None:
+            raise ToolError(f"{show_path(path)} is not an Excel workbook")
+        rels = _rels(z, "xl/_rels/workbook.xml.rels", "xl/")
+        ss = _zip_xml(z, "xl/sharedStrings.xml")
+        shared = [_si_text(si) for si in ss if _local(si.tag) == "si"] if ss is not None else []
+        dates, custom = set(), {}
+        st = _zip_xml(z, "xl/styles.xml")
+        if st is not None:
+            for e in st.iter():
+                if _local(e.tag) == "numFmt":
+                    custom[int(_attr(e, "numFmtId") or -1)] = _attr(e, "formatCode") or ""
+            xfs = next((e for e in st if _local(e.tag) == "cellXfs"), [])
+            for i, xf in enumerate(x for x in xfs if _local(x.tag) == "xf"):
+                fid = int(_attr(xf, "numFmtId") or 0)
+                if 14 <= fid <= 22 or 45 <= fid <= 47 or (fid in custom and _is_date_format(custom[fid])):
+                    dates.add(i)
+        date1904 = any(_local(e.tag) == "workbookPr" and _attr(e, "date1904") in ("1", "true")
+                       for e in wb.iter())
+        sheets = [e for e in wb.iter() if _local(e.tag) == "sheet"]
+        out = [f"Excel workbook with {len(sheets)} sheet{'s' if len(sheets) != 1 else ''}: rows are "
+               "numbered as in Excel, columns are separated by | (A, B, C, …); values as last saved."]
+        for sh in sheets:
+            name, target = _attr(sh, "name"), rels.get(_rid(sh) or "")
+            hidden = " (hidden)" if _attr(sh, "state") in ("hidden", "veryHidden") else ""
+            out += ["", f"## Sheet \"{name}\"{hidden}"]
+            if not target or target not in z.namelist():
+                out.append("(a chart sheet or missing sheet: no cells)")
+                continue
+            count = 0
+            with z.open(target) as fh:
+                for ev, row in ET.iterparse(fh, events=("end",)):
+                    if _local(row.tag) != "row":
+                        continue
+                    cells, col = {}, 0
+                    for c in row:
+                        if _local(c.tag) != "c":
+                            continue
+                        ref = _attr(c, "r")
+                        col = _col_number(ref) if ref else col + 1
+                        t, s = _attr(c, "t"), int(_attr(c, "s") or 0)
+                        v = next((x.text for x in c if _local(x.tag) == "v"), None)
+                        if v is None and t != "inlineStr":
+                            f_ = next((x.text for x in c if _local(x.tag) == "f"), None)
+                            v, t = ("=" + f_, "str") if f_ else (None, t)
+                        if t == "s" and v is not None:
+                            val = shared[int(v)] if int(v) < len(shared) else ""
+                        elif t == "inlineStr":
+                            val = "".join(_si_text(x) for x in c if _local(x.tag) == "is")
+                        elif t == "b":
+                            val = "TRUE" if v == "1" else "FALSE"
+                        elif v is None:
+                            continue
+                        elif t in ("str", "e"):
+                            val = v
+                        elif s in dates:
+                            val = _excel_date(v, date1904)
+                        else:
+                            val = _number(v)
+                        if val != "":
+                            cells[col] = val.replace("\n", " ").replace("|", "\\|")
+                    rnum = _attr(row, "r")
+                    row.clear()
+                    if not cells:
+                        continue
+                    count += 1
+                    if count > MAX_SHEET_ROWS:
+                        out.append("[... more rows; read the sheet with Python (pandas) for all of them]")
+                        break
+                    last = max(cells)
+                    out.append(f"{rnum or count}: " + " | ".join(cells.get(i, "") for i in range(1, last + 1)))
+            if not count:
+                out.append("(empty)")
+    return out
+
+
+# ---- PowerPoint
+def _a_paras(x):
+    out = []
+    for p in x.iter():
+        if _local(p.tag) != "p":
+            continue
+        text = "".join((e.text or "") if _local(e.tag) == "t" else " " for e in p.iter()
+                       if _local(e.tag) in ("t", "br")).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def pptx_text(path):
+    with _open_zip(path) as z:
+        pres = _zip_xml(z, "ppt/presentation.xml")
+        if pres is None:
+            raise ToolError(f"{show_path(path)} is not a PowerPoint presentation")
+        rels = _rels(z, "ppt/_rels/presentation.xml.rels", "ppt/")
+        ids = [_rid(e) for e in pres.iter() if _local(e.tag) == "sldId"]
+        out = [f"PowerPoint presentation with {len(ids)} slides."]
+        for n, rid in enumerate(ids, 1):
+            target = rels.get(rid or "")
+            x = _zip_xml(z, target) if target else None
+            if x is None:
+                continue
+            hidden = " (hidden)" if _attr(x, "show") in ("0", "false") else ""
+            out += ["", f"## Slide {n}{hidden}"] + (_a_paras(x) or ["(no text)"])
+            folder, base = target.rsplit("/", 1)
+            srels = _rels(z, f"{folder}/_rels/{base}.rels", folder + "/")
+            notes = [v for k, v in srels.items() if not k.endswith(":type")
+                     and srels.get(k + ":type", "").endswith("/notesSlide")]
+            nx = _zip_xml(z, notes[0]) if notes else None
+            if nx is not None:
+                text = [t for t in _a_paras(nx) if not t.isdigit()]
+                if text:
+                    out.append("Notes: " + " ".join(text))
+    return out
+
+
+# ---- Stata
+DTA_NUM = {"byte": ("b", 1, 100), "int": ("h", 2, 32740), "long": ("i", 4, 2147483620),
+           "float": ("f", 4, None), "double": ("d", 8, None)}
+DTA_OLD = {251: "byte", 252: "int", 253: "long", 254: "float", 255: "double"}
+DTA_NEW = {65530: "byte", 65529: "int", 65528: "long", 65527: "float", 65526: "double"}
+DTA_VERSION = {113: "Stata 8–9", 114: "Stata 10–11", 115: "Stata 12", 117: "Stata 13",
+               118: "Stata 14 or newer", 119: "Stata 15 or newer, many variables"}
+
+
+def dta_text(path):
+    import struct
+    with open(path, "rb") as f:
+        head = f.read(11)
+        if head == b"<stata_dta>":
+            info = _dta_new(f, struct)
+        elif head[:1] and head[0] in (113, 114, 115) and head[1] in (1, 2):
+            info = _dta_old(f, head, struct)
+        else:
+            raise ToolError(f"{show_path(path)} is not a Stata data file tai can read "
+                            "(Stata 8 or newer)")
+    return _dta_report(info)
+
+
+def _cstr(b, enc):
+    return b.split(b"\0", 1)[0].decode(enc, "replace")
+
+
+def _dta_value(raw, typ, bo, struct, enc, strls):
+    if isinstance(typ, int):                    # str#
+        return _cstr(raw, enc)
+    if typ == "strL":
+        return strls.get(raw, "(long string)")
+    code, size, top = DTA_NUM[typ]
+    v = struct.unpack(bo + code, raw)[0]
+    if top is not None:
+        if v > top:
+            k = v - top - 1
+            return "." if k == 0 else "." + chr(96 + k) if k <= 26 else "."
+        return str(v)
+    bits = struct.unpack(bo + ("I" if size == 4 else "Q"), raw)[0]
+    if (size == 4 and 0x7f000000 <= bits < 0x80000000) or (size == 8 and 0x7fe0000000000000 <= bits < 0x8000000000000000):
+        return "."
+    return f"{v:.7g}" if size == 4 else f"{v:.10g}"
+
+
+def _dta_rows(f, info, struct):
+    widths = [t if isinstance(t, int) else 8 if t == "strL" else DTA_NUM[t][1] for t in info["types"]]
+    rows = []
+    for _ in range(min(info["N"], DTA_ROWS)):
+        raw = f.read(sum(widths))
+        if len(raw) < sum(widths):
+            break
+        pos, row = 0, []
+        for t, w in zip(info["types"], widths):
+            row.append((raw[pos:pos + w], t))
+            pos += w
+        rows.append(row)
+    return rows
+
+
+def _dta_labels(data, bo, struct, enc, namelen, new):
+    """value label tables from the bytes after the data (both formats)."""
+    labels, pos = {}, 0
+    while pos < len(data):
+        if new:
+            if data[pos:pos + 5] != b"<lbl>":
+                break
+            pos += 5
+        if pos + 4 > len(data):
+            break
+        ln = struct.unpack(bo + "I", data[pos:pos + 4])[0]
+        name = _cstr(data[pos + 4:pos + 4 + namelen], enc)
+        pos += 4 + namelen + 3
+        tab = data[pos:pos + ln]
+        pos += ln + (6 if new else 0)            # </lbl>
+        if len(tab) < 8:
+            break
+        n, tl = struct.unpack(bo + "II", tab[:8])
+        offs = struct.unpack(bo + f"{n}I", tab[8:8 + 4 * n])
+        vals = struct.unpack(bo + f"{n}i", tab[8 + 4 * n:8 + 8 * n])
+        txt = tab[8 + 8 * n:8 + 8 * n + tl]
+        labels[name] = {v: _cstr(txt[o:], enc) for v, o in zip(vals, offs)}
+    return labels
+
+
+def _dta_old(f, head, struct):
+    rel, bo = head[0], ">" if head[1] == 1 else "<"
+    enc = "latin-1"
+    f.seek(4)
+    K, N = struct.unpack(bo + "HI", f.read(6))
+    label = _cstr(f.read(81), enc)
+    stamp = _cstr(f.read(18), enc)
+    codes = f.read(K)
+    types = [DTA_OLD.get(c, c) for c in codes]
+    names = [_cstr(f.read(33), enc) for _ in range(K)]
+    f.read(2 * (K + 1))
+    fmts = [_cstr(f.read(12 if rel == 113 else 49), enc) for _ in range(K)]
+    lblnames = [_cstr(f.read(33), enc) for _ in range(K)]
+    varlabels = [_cstr(f.read(81), enc) for _ in range(K)]
+    while True:                                 # expansion fields
+        t = f.read(1)
+        ln = struct.unpack(bo + "I", f.read(4))[0]
+        if not t or (t == b"\0" and ln == 0):
+            break
+        f.seek(ln, 1)
+    info = {"release": rel, "K": K, "N": N, "label": label, "stamp": stamp, "types": types,
+            "names": names, "formats": fmts, "lblnames": lblnames, "varlabels": varlabels,
+            "bo": bo, "enc": enc, "strls": {}}
+    start = f.tell()
+    info["rows"] = _dta_rows(f, info, struct)
+    width = sum(t if isinstance(t, int) else DTA_NUM[t][1] for t in types)
+    f.seek(start + N * width)
+    info["labels"] = _dta_labels(f.read(20_000_000), bo, struct, enc, 33, False)
+    return info
+
+
+def _dta_new(f, struct):
+    def tag(name):
+        t = f"<{name}>".encode()
+        if f.read(len(t)) != t:
+            raise ValueError(f"<{name}> expected")
+
+    def num(code):
+        return struct.unpack(bo + code, f.read(struct.calcsize(code)))[0]
+    bo = "<"
+    tag("header")
+    tag("release")
+    rel = int(f.read(3))
+    f.read(len("</release>"))
+    tag("byteorder")
+    bo = "<" if f.read(3) == b"LSF" else ">"
+    f.read(len("</byteorder>"))
+    tag("K")
+    K = num("I" if rel == 119 else "H")
+    f.read(4)
+    tag("N")
+    N = num("I" if rel == 117 else "Q")
+    f.read(4)
+    enc = "latin-1" if rel == 117 else "utf-8"
+    tag("label")
+    label = f.read(num("B" if rel == 117 else "H")).decode(enc, "replace")
+    f.read(len("</label>"))
+    tag("timestamp")
+    stamp = f.read(f.read(1)[0]).decode(enc, "replace")
+    f.read(len("</timestamp></header>"))
+    tag("map")
+    offs = struct.unpack(bo + "14Q", f.read(112))
+    w = 33 if rel == 117 else 129
+
+    def section(i, name):
+        """Go to a section by the map; some files (from Stata 13) have zeros there: search instead."""
+        t = f"<{name}>".encode()
+        f.seek(offs[i])
+        if offs[i] and f.read(len(t)) == t:
+            return
+        f.seek(0)
+        head = f.read(max(offs[9], offs[i], 1 << 20) + len(t))
+        at = head.find(t)
+        if at < 0:
+            raise ValueError(f"<{name}> not found")
+        f.seek(at + len(t))
+    section(2, "variable_types")
+    codes = struct.unpack(bo + f"{K}H", f.read(2 * K))
+    types = [c if c <= 2045 else "strL" if c == 32768 else DTA_NEW[c] for c in codes]
+    section(3, "varnames")
+    names = [_cstr(f.read(w), enc) for _ in range(K)]
+    section(5, "formats")
+    fmts = [_cstr(f.read(49 if rel == 117 else 57), enc) for _ in range(K)]
+    section(6, "value_label_names")
+    lblnames = [_cstr(f.read(w), enc) for _ in range(K)]
+    section(7, "variable_labels")
+    varlabels = [_cstr(f.read(81 if rel == 117 else 321), enc) for _ in range(K)]
+    info = {"release": rel, "K": K, "N": N, "label": label, "stamp": stamp, "types": types,
+            "names": names, "formats": fmts, "lblnames": lblnames, "varlabels": varlabels,
+            "bo": bo, "enc": enc, "strls": {}}
+    section(9, "data")
+    info["rows"] = _dta_rows(f, info, struct)
+    if "strL" in types and offs[11] - offs[10] < 50_000_000:
+        f.seek(offs[10])
+        data = f.read(offs[11] - offs[10])
+        pos, olen = len("<strls>"), 4 if rel == 117 else 8
+        while data[pos:pos + 3] == b"GSO":
+            v = data[pos + 3:pos + 7]
+            o = data[pos + 7:pos + 7 + olen]
+            t = data[pos + 7 + olen]
+            ln = struct.unpack(bo + "I", data[pos + 8 + olen:pos + 12 + olen])[0]
+            body = data[pos + 12 + olen:pos + 12 + olen + ln]
+            vi, oi = struct.unpack(bo + "I", v)[0], int.from_bytes(o, "little" if bo == "<" else "big")
+            info["strls"][(vi, oi)] = body.rstrip(b"\0").decode(enc, "replace") if t == 130 else "(binary)"
+            pos += 12 + olen + ln
+        vbytes = {117: 4, 118: 2, 119: 3}[rel]
+        order = "little" if bo == "<" else "big"
+        keyed = {}
+        for raw_row in info["rows"]:
+            for raw, t in raw_row:
+                if t == "strL":
+                    vi, oi = int.from_bytes(raw[:vbytes], order), int.from_bytes(raw[vbytes:], order)
+                    keyed[raw] = info["strls"].get((vi, oi), "")
+        info["strls"] = keyed
+    f.seek(offs[11])
+    tag("value_labels")
+    info["labels"] = _dta_labels(f.read(min(offs[12] - offs[11], 20_000_000)), bo, struct, enc, w, True)
+    return info
+
+
+def _stata_date(v, fmt):
+    """A value with a Stata date format (%td, %tc, %tm, %tq) as the date it stands for."""
+    m = re.match(r"%-?(t[cCdwmqhy]|d)", fmt or "")
+    if not m or v.startswith("."):
+        return v
+    try:
+        x = float(v)
+        k = m.group(1)
+        if k in ("td", "d"):
+            return (datetime.date(1960, 1, 1) + datetime.timedelta(days=int(x))).isoformat()
+        if k in ("tc", "tC"):
+            return (datetime.datetime(1960, 1, 1) + datetime.timedelta(milliseconds=x)).strftime("%Y-%m-%d %H:%M:%S")
+        n = int(x)
+        if k == "tm":
+            return f"{1960 + n // 12}m{n % 12 + 1}"
+        if k == "tq":
+            return f"{1960 + n // 4}q{n % 4 + 1}"
+        if k == "th":
+            return f"{1960 + n // 2}h{n % 2 + 1}"
+        if k == "tw":
+            return f"{1960 + n // 52}w{n % 52 + 1}"
+    except (ValueError, OverflowError):
+        pass
+    return v
+
+
+def _dta_report(info):
+    import struct
+    K, N, enc, bo = info["K"], info["N"], info["enc"], info["bo"]
+    tname = lambda t: f"str{t}" if isinstance(t, int) else t
+    out = [f"Stata data set (.dta format {info['release']}, {DTA_VERSION.get(info['release'], 'Stata')}): "
+           f"{N:,} observations, {K} variables."]
+    if info["label"]:
+        out.append(f"Data label: {info['label']}")
+    if info["stamp"]:
+        out.append(f"Saved: {info['stamp']}")
+    out += ["", "Variables (name · type · format · label · value labels):"]
+    for i in range(K):
+        bits = [info["names"][i], tname(info["types"][i]), info["formats"][i]]
+        bits.append(info["varlabels"][i] or "-")
+        lab = info["lblnames"][i]
+        if lab:
+            table = info["labels"].get(lab, {})
+            shown = ", ".join(f"{v} = {t}" for v, t in sorted(table.items())[:12])
+            bits.append(f"{lab}: {shown}{', …' if len(table) > 12 else ''}" if table else lab)
+        out.append("  " + " · ".join(bits))
+    rows = info["rows"]
+    if rows:
+        out += ["", f"First {len(rows)} of {N:,} observations (value labels applied):",
+                "  " + " | ".join(info["names"])]
+        for row in rows:
+            vals = []
+            for i, (raw, t) in enumerate(row):
+                v = _dta_value(raw, t, bo, struct, enc, info["strls"])
+                v = _stata_date(v, info["formats"][i])
+                table = info["labels"].get(info["lblnames"][i]) if info["lblnames"][i] else None
+                if table and v.lstrip("-").isdigit() and int(v) in table:
+                    v = table[int(v)]
+                v = v if len(v) <= 200 else v[:200] + "…"
+                vals.append(v.replace("\n", " ").replace("|", "\\|"))
+            out.append("  " + " | ".join(vals))
+    if N > len(rows):
+        out += ["", "To work with all the data, use Stata, pandas.read_stata in Python or haven::read_dta in R."]
+    return out
+
+
+# ---- Jupyter notebooks
+def nb_source(cell):
+    s = cell.get("source", "")
+    return "".join(s) if isinstance(s, list) else str(s or "")
+
+
+def _nb_text(v):
+    return ANSI.sub("", "".join(v) if isinstance(v, list) else str(v or ""))
+
+
+def _clip_middle(s, n=NB_OUTPUT):
+    if len(s) <= n:
+        return s
+    return s[:n // 2] + f"\n[... {len(s) - n} characters left out ...]\n" + s[-n // 2:]
+
+
+def load_notebook(path, text=None):
+    try:
+        nb = json.loads(read_text(path) if text is None else text)
+    except ValueError as e:
+        raise ToolError(f"{show_path(path)} is not a valid notebook ({e})")
+    if not isinstance(nb, dict) or not isinstance(nb.get("cells"), list):
+        raise ToolError(f"{show_path(path)} is not a Jupyter notebook in the current format (nbformat 4)")
+    return nb
+
+
+def notebook_view(path):
+    """(lines, images) of a notebook as the model sees it; images: [(line index, cell number, part)]."""
+    nb = load_notebook(path)
+    md = nb.get("metadata") if isinstance(nb.get("metadata"), dict) else {}
+    lang = (md.get("kernelspec") or {}).get("language") or (md.get("language_info") or {}).get("name") or ""
+    cells = [c for c in nb["cells"] if isinstance(c, dict)]
+    lines = [f"Jupyter notebook{f' ({lang})' if lang else ''} with {len(cells)} cells. "
+             "Change cells with edit_notebook, by the numbers below."]
+    images = []
+    for i, c in enumerate(cells, 1):
+        typ = c.get("cell_type") or "code"
+        ec = c.get("execution_count")
+        lines.append(f"──── cell {i} · {typ}" + (f" · [{ec}]" if ec else ""))
+        lines += nb_source(c).splitlines() or ["(empty)"]
+        outs = c.get("outputs") if typ == "code" and isinstance(c.get("outputs"), list) else []
+        if outs:
+            lines.append(f"──── output of cell {i}")
+        for o in outs:
+            if not isinstance(o, dict):
+                continue
+            kind = o.get("output_type")
+            if kind == "stream":
+                lines += _clip_middle(_nb_text(o.get("text"))).splitlines()
+            elif kind == "error":
+                tb = _nb_text("\n".join(o.get("traceback") or [])).splitlines()[-30:]
+                first = f"{o.get('ename', 'Error')}: {_nb_text(o.get('evalue'))}"
+                lines += ([] if first in tb else [first]) + tb
+            elif kind in ("execute_result", "display_data"):
+                data = o.get("data") if isinstance(o.get("data"), dict) else {}
+                pic = next((m for m in ("image/png", "image/jpeg", "image/gif", "image/webp") if m in data), None)
+                if pic:
+                    b64 = re.sub(r"\s", "", _nb_text(data[pic]))
+                    if len(b64) * 3 // 4 > MAX_IMAGE:
+                        lines.append("[image: too large to show]")
+                    else:
+                        part = {"type": "image_url", "image_url": {"url": f"data:{pic};base64,{b64}"}}
+                        images.append((len(lines), i, part))
+                        lines.append(f"[image {len(images)}]")
+                elif "text/markdown" in data:
+                    lines += _clip_middle(_nb_text(data["text/markdown"])).splitlines()
+                elif "text/plain" in data:
+                    lines += _clip_middle(_nb_text(data["text/plain"])).splitlines()
+                elif "text/html" in data:
+                    lines += _clip_middle(html_to_text(_nb_text(data["text/html"]))).splitlines()
+                elif "image/svg+xml" in data:
+                    lines.append("[SVG image: not shown]")
+    return lines, images
+
+
+def _nb_format(nb, text):
+    """(indent, sort_keys) that reproduce the file as saved, so edits change only their cell."""
+    for indent in (1, 2, 4, None):
+        for sort in (True, False):
+            if json.dumps(nb, indent=indent, sort_keys=sort, ensure_ascii=False).strip() == text.strip():
+                return indent, sort
+    return 1, True                              # how Jupyter saves notebooks
+
+
+def _nb_source_lines(src):
+    return src.splitlines(keepends=True)
+
+
+def tool_edit_notebook(a, perms):
+    path = resolve(a["path"])
+    label = show_path(path)
+    if path.suffix.lower() != ".ipynb":
+        raise ToolError("edit_notebook is for Jupyter notebooks (.ipynb); use edit_file for other files")
+    old = read_text(path)
+    nb = load_notebook(path, old)
+    indent, sort = _nb_format(nb, old)
+    cells = nb["cells"]
+    action = str(a.get("action") or "replace").lower()
+    n = int(a["cell"])
+    src = a.get("source")
+    ctype = a.get("cell_type")
+    if ctype not in (None, "code", "markdown", "raw"):
+        raise ToolError("cell_type must be code, markdown or raw")
+
+    def new_cell(typ, source, cid=None):
+        c = {"cell_type": typ, "metadata": {}, "source": _nb_source_lines(source)}
+        if typ == "code":
+            c.update(execution_count=None, outputs=[])
+        if cid or (nb.get("nbformat", 4) >= 4 and nb.get("nbformat_minor", 0) >= 5):
+            import uuid
+            c["id"] = cid or uuid.uuid4().hex[:8]
+        return c
+    before = ""
+    if action == "insert":
+        if not 0 <= n <= len(cells):
+            raise ToolError(f"cell must be 0 to {len(cells)} for insert (the new cell goes after it)")
+        if src is None:
+            raise ToolError("insert needs the source of the new cell")
+        cells.insert(n, new_cell(ctype or "code", src))
+        shown, after, verb = n + 1, src, f"Insert cell {n + 1} into"
+    elif not 1 <= n <= len(cells):
+        raise ToolError(f"there is no cell {n}; the notebook has {len(cells)} cells (numbered from 1)")
+    elif action == "delete":
+        before, after = nb_source(cells[n - 1]), ""
+        del cells[n - 1]
+        shown, verb = n, f"Delete cell {n} of"
+    elif action == "replace":
+        if src is None:
+            raise ToolError("replace needs the new source of the cell")
+        cell = cells[n - 1]
+        before, after = nb_source(cell), src
+        typ = ctype or cell.get("cell_type") or "code"
+        if typ != cell.get("cell_type"):
+            cells[n - 1] = new_cell(typ, src, cell.get("id"))
+        else:
+            cell["source"] = _nb_source_lines(src)
+            if typ == "code":               # the old outputs no longer belong to this code
+                cell["outputs"], cell["execution_count"] = [], None
+        shown, verb = n, f"Change cell {n} of"
+    else:
+        raise ToolError("action must be replace, insert or delete")
+    new = json.dumps(nb, indent=indent, sort_keys=sort, ensure_ascii=False) + "\n"
+    body = diff_view(before, after, f"{label} · cell {shown}")
+    write_after_approval(path, old, new, perms, verb, body=body)
+    done = {"insert": "Inserted", "delete": "Deleted", "replace": "Changed"}[action]
+    note = " (its old outputs were removed; run the notebook to get new ones)" \
+        if action == "replace" and (ctype or "code") == "code" else ""
+    return (f"{done} cell {shown} of {label}{note}. Cell numbers are now as in read_file again.",
+            f"{done} cell {shown} of {label}")
+
+
 def tool_web_fetch(a, perms):
     url = a["url"].strip()
     if not re.match(r"https?://", url, re.I):
@@ -1822,8 +2697,10 @@ S = {"type": "string"}
 # The shell tool: bash on Linux/macOS, PowerShell on Windows (named so the model writes the right syntax).
 SHELL_TOOL, SHELL_LABEL = ("powershell", "PowerShell") if WINDOWS else ("bash", "Bash")
 TOOLS = [
-    fn("read_file", "Read a text or PDF file (returns numbered lines; use offset/limit for long files), or "
-       "look at an image (PNG, JPEG, GIF, WebP), e.g. a plot or a screenshot.",
+    fn("read_file", "Read a file: text, PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), Stata data "
+       "(.dta: variables, labels and the first rows) or a Jupyter notebook (.ipynb: cells with their "
+       "outputs and plots). Returns numbered lines; use offset/limit for long files. Also looks at "
+       "images (PNG, JPEG, GIF, WebP), e.g. a plot or a screenshot.",
        {"path": S, "offset": {"type": "integer", "description": "1-based first line"},
         "limit": {"type": "integer", "description": "max lines, default 2000"}}, ["path"]),
     fn("list_files", "List files and folders matching a glob pattern such as '*', '**/*.py' or "
@@ -1840,6 +2717,16 @@ TOOLS = [
        "(including whitespace) unless replace_all is true. Read the file first. Requires user approval.",
        {"path": S, "old_string": S, "new_string": S, "replace_all": {"type": "boolean"}},
        ["path", "old_string", "new_string"]),
+    fn("edit_notebook", "Change one cell of a Jupyter notebook (.ipynb), by the cell number read_file "
+       "shows. action: replace (new source for cell N; a code cell's old outputs are removed), insert "
+       "(a new cell after cell N, 0 = at the top) or delete. It doesn't run the notebook (to run it: "
+       "jupyter nbconvert --to notebook --execute --inplace FILE). Requires user approval.",
+       {"path": S, "cell": {"type": "integer", "description": "cell number, from 1"},
+        "action": {"type": "string", "enum": ["replace", "insert", "delete"]},
+        "source": {"type": "string", "description": "the cell's new content (replace, insert)"},
+        "cell_type": {"type": "string", "enum": ["code", "markdown", "raw"],
+                      "description": "for insert (default code), or to change a cell's type"}},
+       ["path", "cell", "action"]),
     fn(SHELL_TOOL, f"Run a {SHELL_LABEL} command in the current directory; returns combined "
        "stdout/stderr and the exit code. Requires user approval. Non-interactive: never run commands "
        "that wait for input.",
@@ -1883,15 +2770,69 @@ TOOLS = [
        ["description", "prompt"]),
 ]
 SUB_TOOLS = [t for t in TOOLS if t["function"]["name"] not in ("task", "todo_write")]
+# plan mode: tai reads and researches, then asks the user to approve its plan
+PLAN_READ = {"read_file", "list_files", "grep", "get_diagnostics", "web_search", "web_fetch", "task",
+             "job_output"}
+PLAN_TOOL = fn("present_plan", "Plan mode only: show the user your plan and ask them to approve it. Call "
+               "it when the plan is ready. If they approve, plan mode ends and you carry the plan out "
+               "right away; if not, they say what to change.",
+               {"plan": {"type": "string", "description":
+                   "the plan in markdown: the goal, the steps (which files change and how), what you "
+                   "will check at the end, and open questions if any"}}, ["plan"])
+PLAN_NOTE = ("[Plan mode is on: the user wants a plan before anything changes. Explore with the "
+             "read-only tools (files, search, the web), ask the user if something essential is unclear, "
+             "then present a concrete plan with present_plan. Don't edit files or run commands: that "
+             "starts after the user approves the plan.]")
+
+
+def plan_tools(tools, sub=False):
+    """The tools for plan mode: only those that read, and present_plan."""
+    if not tools:
+        return tools
+    kept = [t for t in tools if t["function"]["name"] in PLAN_READ]
+    return kept if sub else kept + [PLAN_TOOL]
+
+
+def mode_tools(tools, perms, sub=False):
+    return plan_tools(tools, sub) if perms.mode == "plan" else tools
+
+
+def tool_present_plan(a, perms):
+    plan = str(a.get("plan") or "").strip()
+    if not plan:
+        raise ToolError("the plan is empty")
+    if perms.mode != "plan":
+        return "Plan mode is off: go ahead with the work.", "Plan (plan mode is off)"
+    body = Markdown(plan) if RICH else plan
+    try:
+        perms.check("plan", "Start working on this plan?", "Plan", body, detail={"type": "plan", "plan": plan})
+    except Denied as d:
+        if CANCEL.is_set() or str(d) == "Cancelled.":
+            raise
+        if str(d).startswith("No terminal"):
+            return ("Nobody can approve the plan here (tai runs without a terminal). Give the plan in "
+                    "your reply and stop; don't call present_plan again."), "Plan (no terminal to approve it)"
+        say_ = f" They say: {d}" if str(d) else " Ask them what to change if it isn't clear."
+        return (f"The user did not approve the plan yet.{say_} Stay in plan mode: revise the plan and "
+                "present it again with present_plan."), "Plan not approved" + (f" — {d}" if str(d) else "")
+    if perms.mode == "plan":
+        perms.set_mode("manual")
+    how = {"accept-edits": "file edits now run without asking",
+           "manual": "file edits and commands ask the user first"}.get(perms.mode, f"mode: {perms.mode}")
+    return (f"The user approved the plan; plan mode is off ({how}). Carry the plan out now, step by step "
+            "(keep a task list with todo_write).", f"Plan approved · {perms.mode}")
 RUNNERS = {"read_file": tool_read_file, "list_files": tool_list_files, "grep": tool_grep,
            "write_file": tool_write_file, "edit_file": tool_edit_file, SHELL_TOOL: tool_bash,
+           "edit_notebook": tool_edit_notebook,
            "web_search": tool_web_search, "web_fetch": tool_web_fetch, "job_output": tool_job_output,
-           "job_stop": tool_job_stop, "todo_write": tool_todo_write}
+           "job_stop": tool_job_stop, "todo_write": tool_todo_write, "present_plan": tool_present_plan}
 LABELS = {"read_file": ("Read", "path"), "list_files": ("List", "pattern"), "grep": ("Grep", "pattern"),
           "write_file": ("Write", "path"), "edit_file": ("Edit", "path"),
+          "edit_notebook": ("EditNotebook", "path"),
           SHELL_TOOL: (SHELL_LABEL, "command"),
           "web_search": ("WebSearch", "query"), "web_fetch": ("Fetch", "url"),
-          "job_output": ("JobOutput", "job_id"), "job_stop": ("JobStop", "job_id"), "todo_write": ("Tasks", None)}
+          "job_output": ("JobOutput", "job_id"), "job_stop": ("JobStop", "job_id"), "todo_write": ("Tasks", None),
+          "present_plan": ("Plan", None)}
 
 
 def parse_args(call):
@@ -1978,7 +2919,7 @@ def subagent(args, label, perms, model):
             if CANCEL.is_set():
                 return "Sub-agent stopped: the user interrupted." + (f" Notes so far: {text}" if text else "")
             text, calls, usage = "", [], None
-            gen = stream_reply(model, msgs, SUB_TOOLS)
+            gen = stream_reply(model, msgs, mode_tools(SUB_TOOLS, perms, sub=True))
             try:
                 for kind, val in gen:
                     if CANCEL.is_set():
@@ -2116,13 +3057,14 @@ def system_prompt(use_tools, extra=None, sub=False, ide=False):
             "- Work step by step. Read a file before editing it; prefer edit_file with small, exact "
             "replacements over rewriting whole files.\n"
             "- read_file also shows you images (PNG, JPEG, GIF, WebP): look at plots you made to check "
-            "them, and at screenshots the user mentions.\n"
+            "them, and at screenshots the user mentions. It also reads Word, Excel, PowerPoint, Stata and "
+            "notebook files; change notebooks with edit_notebook.\n"
             "- For current events, facts you're unsure of, papers or documentation: use web_search, "
             "then web_fetch to read the best sources. Cite URLs in your answer.\n"
             + ("" if sub else
                "- For larger jobs, delegate self-contained parts to sub-agents with the task tool; "
                "several task calls in one reply run in parallel (e.g. one per question or source).\n")
-            + f"- write_file, edit_file, {SHELL_TOOL} and web_fetch need the user's approval. If the user denies "
+            + f"- write_file, edit_file, edit_notebook, {SHELL_TOOL} and web_fetch need the user's approval. If the user denies "
             "an action, don't retry it; follow their instructions or ask.\n"
             "- Never run destructive or irreversible commands (deleting files, git reset --hard, "
             "overwriting data, sending data to remote services) unless the user explicitly asked.\n"
@@ -2130,7 +3072,9 @@ def system_prompt(use_tools, extra=None, sub=False, ide=False):
             "watchers and long builds or analyses, set run_in_background and check on them with "
             "job_output; stop them with job_stop when they are no longer needed.\n"
             + ("" if sub else
-               "- For a task with several steps, keep a task list with todo_write and update it as you go.\n")
+               "- For a task with several steps, keep a task list with todo_write and update it as you go.\n"
+               f"- Asked to remember something for later conversations: add a line to {PERSONAL_MD} "
+               "(all projects) or ./TAI.md (this project).\n")
             +
             "- When done, say briefly what you did. Be concise; use markdown.")
     else:
@@ -2143,7 +3087,13 @@ def system_prompt(use_tools, extra=None, sub=False, ide=False):
             "comment on them otherwise. After editing code, use get_diagnostics to check for errors "
             "and warnings that VS Code reports. Refer to files with paths relative to the current "
             "directory (with :line where useful); the user can click them.")
-    for name in ("TAI.md", "CLAUDE.md", "AGENTS.md"):
+    try:
+        personal = read_text(PERSONAL_MD)[:20000].strip() if PERSONAL_MD.is_file() else ""
+    except ToolError:
+        personal = ""
+    if personal:
+        parts.append(f"The user's own instructions for all projects (from {PERSONAL_MD}):\n{personal}")
+    for name in PROJECT_MD:
         f = cwd / name
         if use_tools and f.is_file():
             parts.append(f"Project instructions from {name}:\n" + read_text(f)[:20000])
@@ -2309,7 +3259,7 @@ def run_turn(conv, perms, markdown, use_tools):
                 return
             auto_failed = r != "done"
         try:
-            text, calls, usage = stream_and_render(conv["model"], msgs, tools, markdown)
+            text, calls, usage = stream_and_render(conv["model"], msgs, mode_tools(tools, perms), markdown)
         except KeyboardInterrupt as e:
             err("\n[interrupted]")
             if getattr(e, "partial", ""):
@@ -2382,7 +3332,11 @@ def read_file_block(path):
             raise RuntimeError(str(e)) from None
         return [{"type": "text", "text": f'<file name="{p.name}">(image, attached below)</file>'}, part]
     try:
-        text = decode(p.read_bytes())[0]
+        text = document_text(p.resolve()) if p.suffix.lower() in DOC_TYPES else None
+        if text is None:
+            text = decode(p.read_bytes())[0]
+    except ToolError as e:
+        raise RuntimeError(str(e)) from None
     except OSError as e:
         raise RuntimeError(f"cannot read {path}: {e.strerror}") from None
     return f'<file name="{p.name}">\n{text}\n</file>'
@@ -2425,18 +3379,20 @@ HELP = """Commands:
   /system [text]  show or add instructions    /save PATH  save conversation as markdown
   /file PATH      attach a file to your next message
   /btw QUESTION   quick side question; answer is not added to the conversation
-  /mode [name]    show or set permission mode (manual, accept-edits, auto)
+  /mode [name]    show or set permission mode (manual, accept-edits, auto, plan)
   /usage          token usage this session
   /compact [what to keep]  summarize the conversation to free up context (also automatic
                   when the context window is 80% full)
   /rewind [N]     go back to an earlier message and undo tai's file changes since then
   /permissions    show the saved permission rules, where they are stored, and the sandbox
+  /remember TEXT  keep an instruction for all later conversations (/remember project TEXT:
+                  for this project, in its TAI.md); /remember alone shows both
   /review [REF] [focus]  review the changes in git: not yet committed, or everything since
                   REF (a branch or commit, e.g. /review main); tai only reads, it changes nothing
   /jobs           commands running in the background; /jobs stop ID stops one
   /help           this help                   /exit     quit (or Ctrl+C twice, or Ctrl+D)
 Alt+Enter inserts a new line (pasting multi-line text also works).
-Shift+Tab cycles the permission mode (manual → accept-edits → auto).
+Shift+Tab cycles the permission mode (manual → accept-edits → auto → plan: tai plans first).
 While tai works the prompt stays open: /btw QUESTION is answered right away, and a
 message you type is read at tai's next step.
 Ctrl+C clears what you typed, then stops tai (queued messages come back); at an empty
@@ -2461,6 +3417,47 @@ def read_input(prompt):
         lines.append(nxt)
 
 
+PERSONAL_MD = STATE_DIR / "TAI.md"           # the user's instructions for all projects (/remember)
+PROJECT_MD = ("TAI.md", "CLAUDE.md", "AGENTS.md")
+
+
+def project_md():
+    cwd = Path.cwd()
+    return next((cwd / n for n in PROJECT_MD if (cwd / n).is_file()), cwd / "TAI.md")
+
+
+def remember(text, project=False):
+    """Add a line to the personal or the project instructions; returns the file."""
+    text = " ".join(str(text).split())
+    if not text:
+        raise ValueError("nothing to remember")
+    path = project_md() if project else PERSONAL_MD
+    try:
+        old = read_text(path) if path.exists() else ""
+    except ToolError:
+        old = ""
+    if not old.strip() and not project:
+        old = "# My instructions for tai (all projects)\n\n"
+    elif old and not old.endswith("\n"):
+        old += "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text(path, old + f"- {text}\n", text_format(path) if path.exists() else ("utf-8", "\n"))
+    return path
+
+
+def memory_text():
+    """/remember without text: where the instructions are, and what they say."""
+    out = []
+    for label, path in (("Yours, for all projects", PERSONAL_MD), ("This project's", project_md())):
+        try:
+            body = read_text(path).strip() if path.is_file() else ""
+        except ToolError:
+            body = ""
+        out.append(f"{label}: {path}" + ("" if body else " (empty)"))
+        out += ["  " + l for l in body.splitlines()[:40]]
+    return "\n".join(out)
+
+
 def new_conv(model, use_tools, extra_system=None):
     return {"model": model, "tools": use_tools, "extra_system": extra_system,
             "messages": [{"role": "system", "content": system_prompt(use_tools, extra_system)}]}
@@ -2482,10 +3479,16 @@ def ask(conv, perms, markdown, content, tools=None):
     note = finished_jobs_note()
     if note:
         msgs.append({"role": "user", "content": note})
+    if perms.mode == "plan" and conv["tools"] and tools is None:
+        msgs.append({"role": "user", "content": PLAN_NOTE})
     msgs.append(user)
     start_checkpoint(conv, len(msgs) - 1)
     print()
-    run_turn(conv, perms, markdown, conv["tools"] if tools is None else tools)
+    TURN_CLOCK["start"] = time.time()
+    try:
+        run_turn(conv, perms, markdown, conv["tools"] if tools is None else tools)
+    finally:
+        notify_done()
     if msgs and msgs[-1] is user:               # request failed before any reply: allow retry
         msgs.pop()
         turns = conv.get("turns") or []
@@ -2529,7 +3532,7 @@ def is_note(m):
     """Messages tai wrote itself (compaction summary, 'continue' note), not the user's."""
     c = m.get("content")
     return isinstance(c, str) and (c.startswith(("[Summary of the earlier conversation]", "[Background job"))
-                                   or c == CONTINUE_NOTE)
+                                   or c in (CONTINUE_NOTE, PLAN_NOTE))
 
 
 def visible_text(content):
@@ -2759,7 +3762,7 @@ def review_tools(tools):
 # (yours). /NAME runs the file's text as a message; $ARGUMENTS is replaced by what follows /NAME.
 BUILTIN_COMMANDS = {"help", "model", "models", "tools", "clear", "system", "file", "save", "btw", "mode",
                     "usage", "compact", "rewind", "permissions", "jobs", "exit", "quit", "q", "review",
-                    "history", "terminal", "restart", "new"}
+                    "history", "terminal", "restart", "new", "remember"}
 
 
 def command_dirs():
@@ -2823,6 +3826,7 @@ COMMANDS = [("/help", "show commands"), ("/model", "show or switch model"), ("/m
             ("/compact", "summarize the conversation to free up context"),
             ("/rewind", "go back to an earlier message (and undo file changes)"),
             ("/permissions", "show saved permission rules and the sandbox"),
+            ("/remember", "keep an instruction for later conversations"),
             ("/review", "review the changes in git (/review main: everything since main)"),
             ("/jobs", "background commands (/jobs stop ID)"),
             ("/exit", "quit")]
@@ -2913,8 +3917,10 @@ def make_reader(conv, perms):
             line.append(("class:hint", f" · {USAGE.ctx_text()}"))
         line.append(("class:rule", "\n"))
         if conv["tools"]:
-            cls = {"manual": "class:hint", "accept-edits": "class:modeedit", "auto": "class:modeauto"}[perms.mode]
-            icon = {"manual": "  ⏸ manual", "accept-edits": "  ⏵ accept edits", "auto": "  ⏵⏵ auto"}[perms.mode]
+            cls = {"manual": "class:hint", "accept-edits": "class:modeedit", "auto": "class:modeauto",
+                   "plan": "class:modeplan"}[perms.mode]
+            icon = {"manual": "  ⏸ manual", "accept-edits": "  ⏵ accept edits", "auto": "  ⏵⏵ auto",
+                    "plan": "  ◇ plan"}[perms.mode]
             line += [(cls, icon), ("class:hint", " (shift+tab to cycle)")]
         else:
             line.append(("class:hint", "  chat mode"))
@@ -2924,6 +3930,7 @@ def make_reader(conv, perms):
     style = Style.from_dict({
         "rule": "#5a5a5a", "prompt": f"{GOLD} bold", "model": GOLD, "hint": "#8a8a8a",
         "warn": "#e0a040 bold", "modeedit": f"{BLUE} bold", "modeauto": "#d0605a bold",
+        "modeplan": "#4fa88a bold",
         "spin": f"{GOLD} bold",
         "bottom-toolbar": "noreverse bg:default",
         "completion-menu.completion": "bg:#2b2b2b #d0d0d0",
@@ -3004,6 +4011,7 @@ def stop_turn():
 
 # commands that make sense while tai is working (others change what the turn is working on)
 BUSY_OK = {"/btw", "/mode", "/usage", "/help", "/model", "/models", "/file", "/save", "/permissions", "/jobs",
+           "/remember",
            "/exit", "/quit", "/q"}
 
 
@@ -3170,6 +4178,22 @@ def _repl_line(text, conv, perms, markdown, pending, start):
             start(job=lambda: ask(conv, perms, markdown, content, tools=tools))
         elif cmd == "/jobs":
             jobs_command(arg)
+        elif cmd == "/remember":
+            if not arg:
+                dim(memory_text())
+                dim("  /remember TEXT adds a line for all your projects; /remember project TEXT for this one")
+                return
+            here, _, rest = arg.partition(" ")
+            project = here.lower() == "project" and rest.strip()
+            try:
+                path = remember(rest if project else arg, bool(project))
+            except (OSError, ToolError, ValueError) as e:
+                err(f"tai: could not save it: {e}")
+                return
+            msgs = conv["messages"]
+            if msgs and msgs[0].get("role") == "system":
+                msgs[0] = {"role": "system", "content": system_prompt(conv["tools"], conv.get("extra_system"))}
+            dim(f"  remembered in {show_path(path)}" + ("" if project else " (for all your projects)"))
         elif cmd == "/permissions":
             lines = SETTINGS.describe()
             dim(f"mode: {perms.mode} — {mode_info()[perms.mode]}")
@@ -3388,10 +4412,11 @@ class ServerPermissions(Permissions):
         def settled():
             try:
                 return CANCEL.is_set() or self.preflight(kind, detail)
-            except Denied:
+            except (Denied, ToolError):
                 return True
         res = self.proto.request("approval", {
             "kind": kind, "title": title, "question": question, "always": always,
+            "labels": list(choice_labels(kind, always)),
             "detail": shown, "agent": getattr(_tls, "label", "")}, abort=settled)
         if self.preflight(kind, detail):
             return                  # approved meanwhile ("always" in another card, or mode changed)
@@ -3630,6 +4655,7 @@ class Server:
     def __init__(self, proto, model, mode):
         self.proto = proto
         self.perms = ServerPermissions(proto, mode)
+        self.perms.on_mode = lambda m: self.proto.event("state", state=self.state())
         self.lock = threading.RLock()
         self.busy = False
         self.compacting = False
@@ -3807,8 +4833,8 @@ class Server:
                     blocks.append(f'<directory path="{rel}">\n' + "\n".join(names) + "\n</directory>")
                     files.append(rel + "/")
                     continue
-                if path.suffix.lower() == ".pdf":
-                    body = pdf_to_text(path.read_bytes())
+                if path.suffix.lower() in DOC_TYPES:
+                    body = document_text(path)
                 elif is_binary(path):
                     blocks.append(f'<file path="{rel}">(binary file, not attached)</file>')
                     files.append(rel)
@@ -4056,7 +5082,7 @@ class Server:
                     return ("Sub-agent stopped: the user interrupted."
                             + (f" Notes so far: {text}" if text else ""), {"uses": uses, "tokens": tokens})
                 try:
-                    text, calls, usage = self.stream(model, msgs, self.tools(sub=True), main=False,
+                    text, calls, usage = self.stream(model, msgs, mode_tools(self.tools(sub=True), self.perms, sub=True), main=False,
                                                      agent=task_id)
                 except Cancelled as c:
                     text = c.partial
@@ -4114,6 +5140,8 @@ class Server:
         note = finished_jobs_note()
         if note:
             self.add_note(note)
+        if self.perms.mode == "plan" and self.conv["tools"] and not display.get("readonly"):
+            self.add_note(PLAN_NOTE)
         idx = self.add_user(content, display, client_id)
         self.proto.event("turn_start", index=idx)
         replied, reason, error = False, "done", None
@@ -4145,7 +5173,8 @@ class Server:
                 if not auto_failed and compact_due(msgs):
                     auto_failed = not compact(False)
                 try:
-                    tools = review_tools(self.tools()) if display.get("readonly") else self.tools()
+                    tools = review_tools(self.tools()) if display.get("readonly") else \
+                        mode_tools(self.tools(), self.perms)
                     text, calls, usage = self.stream(self.conv["model"], msgs, tools, on_text=on_text)
                 except RuntimeError as e:
                     if retried or not CONTEXT_FULL.search(str(e)) or self.streaming_text:
@@ -4406,6 +5435,29 @@ class Server:
         """The settings file with the saved rules (created if missing), for the editor to open."""
         return {"path": str(SETTINGS.ensure()), "rules": SETTINGS.describe(), "sandbox": SANDBOX.describe()}
 
+    def m_remember(self, p):
+        """Add a line to the user's (scope "personal") or the project's instructions; without
+        text, just return the files (created when "create" is set, for the editor to open)."""
+        project = p.get("scope") == "project"
+        text = str(p.get("text") or "").strip()
+        if text:
+            path = remember(text, project)
+            with self.lock:
+                msgs = self.conv["messages"]
+                if msgs and msgs[0].get("role") == "system":
+                    msgs[0] = {"role": "system", "content": system_prompt(
+                        self.conv["tools"], self.conv.get("extra_system"), ide=self.ide)}
+        else:
+            path = project_md() if project else PERSONAL_MD
+            if p.get("create") and not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_text(path, "" if project else "# My instructions for tai (all projects)\n\n")
+        return {"path": str(path), "personal": str(PERSONAL_MD), "project": str(project_md())}
+
+    def m_notify(self, p):
+        """A desktop notification, for the editor when its window is not in front."""
+        return {"shown": desktop_notify(str(p.get("title") or "tai"), str(p.get("text") or ""))}
+
     def m_models(self, p):
         return {"models": [{"id": m["id"], "maxInput": m.get("max_input_tokens"),
                             "embedding": m.get("mode") == "embedding"} for m in list_models()]}
@@ -4554,7 +5606,7 @@ def serve(args):
     if RICH:
         console.file = sys.stderr
     proto = Proto(proto_out)
-    mode = "auto" if args.auto else "accept-edits" if args.auto_edit else "manual"
+    mode = "plan" if args.plan else "auto" if args.auto else "accept-edits" if args.auto_edit else "manual"
     server = Server(proto, args.model or DEFAULT_MODEL, mode)
     if args.chat:
         server.conv["tools"] = False
@@ -4629,6 +5681,8 @@ def main():
                     help="start in accept-edits mode: file edits run without asking")
     ap.add_argument("--auto", action="store_true",
                     help="start in auto mode: edits, commands and fetches run without asking")
+    ap.add_argument("--plan", action="store_true",
+                    help="start in plan mode: tai reads and plans, and asks you to approve the plan first")
     ap.add_argument("--raw", action="store_true", help="plain text output, no markdown rendering")
     ap.add_argument("--models", action="store_true", help="list available models")
     ap.add_argument("-r", "--resume", metavar="ID", help="resume a saved session (e.g. one from VS Code)")
@@ -4679,7 +5733,7 @@ def main():
         if args.system:
             conv["extra_system"] = args.system
         reset_system(conv)
-    perms = Permissions("auto" if args.auto else "accept-edits" if args.auto_edit else "manual")
+    perms = Permissions("plan" if args.plan else "auto" if args.auto else "accept-edits" if args.auto_edit else "manual")
     IO_HOOKS["todos"] = lambda items: conv.__setitem__("todos", items)
 
     try:

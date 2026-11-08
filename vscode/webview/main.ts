@@ -46,6 +46,8 @@ function persist() {
   vscode.setState({ sessionId: S.state?.session.id, draft: input.value, history: S.history.slice(-50) });
 }
 
+const MODES: Mode[] = ["manual", "accept-edits", "auto", "plan"];
+
 const hooks: RenderHooks = {
   openFile: (path, line) => send({ type: "openFile", path, line }),
   copy: (text) => { send({ type: "copy", text }); toast("Copied"); },
@@ -483,6 +485,10 @@ function addApproval(requestId: string, p: ApprovalParams) {
     card.append(el("div", "approval-url", d.url ?? ""));
   } else if (d.type === "read") {
     card.append(el("div", "approval-path", relPath(d.path ?? "")));
+  } else if (d.type === "plan") {
+    const plan = el("div", "approval-plan md");
+    renderMarkdown(plan, d.plan ?? "", hooks, true);
+    card.append(plan);
   }
   card.append(el("div", "approval-q", p.question));
   const opts = el("div", "approval-opts");
@@ -492,13 +498,14 @@ function addApproval(requestId: string, p: ApprovalParams) {
     b.addEventListener("click", () => choose(dec));
     return b;
   };
-  opts.append(mk("1", "Yes", "yes", "primary"), mk("2", `Yes, and don't ask again ${p.always}`.trim(), "always"),
-    mk("3", "No, and tell tai what to do differently", "no"));
+  const [yes, yes2, no] = p.labels ?? ["Yes", `Yes, and don't ask again ${p.always}`.trim(), "No, and tell tai what to do differently"];
+  opts.append(mk("1", yes, "yes", "primary"), mk("2", yes2, "always"), mk("3", no, "no"));
   card.append(opts);
   const fb = el("div", "feedback");
   fb.hidden = true;
   const fbInput = el("input") as HTMLInputElement;
-  fbInput.placeholder = "What should tai do instead? (Enter to send, Esc to skip)";
+  fbInput.placeholder = d.type === "plan" ? "What should tai change in the plan? (Enter to send, Esc to skip)"
+    : "What should tai do instead? (Enter to send, Esc to skip)";
   fb.append(fbInput);
   card.append(fb);
 
@@ -569,7 +576,8 @@ const COMMANDS: [string, string][] = [
   ["/clear", "start a new conversation"],
   ["/compact", "summarize the conversation to free up context"],
   ["/model", "switch model"],
-  ["/mode", "set permission mode (manual, accept-edits, auto)"],
+  ["/mode", "set permission mode (manual, accept-edits, auto, plan)"],
+  ["/remember", "keep an instruction for later conversations (all projects or this one)"],
   ["/history", "open an earlier conversation"],
   ["/rewind", "go back to an earlier message"],
   ["/permissions", "show and edit the saved permission rules, and the sandbox"],
@@ -632,7 +640,7 @@ function updateToolbar() {
   renderTodos();
   const st = S.state;
   const mode: Mode = st?.mode ?? "manual";
-  const label = { manual: "⏸ manual", "accept-edits": "⏵ accept edits", auto: "⏵⏵ auto" }[mode];
+  const label = { manual: "⏸ manual", "accept-edits": "⏵ accept edits", auto: "⏵⏵ auto", plan: "◇ plan" }[mode];
   modeBtn.textContent = st?.tools === false ? "chat only" : label;
   modeBtn.className = "pill mode-" + (st?.tools === false ? "chat" : mode);
   modeBtn.title = (st?.tools === false ? "Tools are off (/tools)" : (S.modeInfo[mode] ?? mode)) + " — Shift+Tab to cycle";
@@ -748,10 +756,9 @@ function runCommand(cmd: string, arg: string, _rest: string[]): boolean {
       send({ type: "newSession" });
       return true;
     case "mode": {
-      const modes: Mode[] = ["manual", "accept-edits", "auto"];
-      if (arg && !modes.includes(arg as Mode)) { addNotice("error", `Unknown mode ${arg}: use manual, accept-edits or auto`); return false; }
+      if (arg && !MODES.includes(arg as Mode)) { addNotice("error", `Unknown mode ${arg}: use manual, accept-edits, auto or plan`); return false; }
       const cur = S.state?.mode ?? "manual";
-      send({ type: "setMode", mode: (arg as Mode) || modes[(modes.indexOf(cur) + 1) % 3] });
+      send({ type: "setMode", mode: (arg as Mode) || MODES[(MODES.indexOf(cur) + 1) % MODES.length] });
       return true;
     }
     case "models":
@@ -759,6 +766,7 @@ function runCommand(cmd: string, arg: string, _rest: string[]): boolean {
       return true;
     case "model": case "tools": case "system": case "compact": case "usage": case "save":
     case "history": case "resume": case "terminal": case "restart": case "rewind": case "permissions": case "jobs":
+    case "remember":
       if (cmd === "compact" && !S.busy) {
         S.compacting = true;
         S.turnStart = Date.now();
@@ -964,9 +972,8 @@ input.addEventListener("keydown", (e) => {
 });
 
 function cycleMode() {
-  const modes: Mode[] = ["manual", "accept-edits", "auto"];
   const cur = S.state?.mode ?? "manual";
-  const next = modes[(modes.indexOf(cur) + 1) % 3];
+  const next = MODES[(MODES.indexOf(cur) + 1) % MODES.length];
   if (S.state) S.state.mode = next;
   updateToolbar();
   send({ type: "setMode", mode: next });

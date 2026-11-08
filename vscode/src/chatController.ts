@@ -31,7 +31,7 @@ interface PendingApproval {
   resolve: (r: { decision: Decision; feedback?: string } | null) => void;
 }
 
-const MODES: Mode[] = ["manual", "accept-edits", "auto"];
+const MODES: Mode[] = ["manual", "accept-edits", "auto", "plan"];
 
 export function config() {
   return vscode.workspace.getConfiguration("tai");
@@ -101,7 +101,7 @@ export class ChatController implements vscode.Disposable {
   /** Called when the session changes (title for tabs, persistence). */
   onSession?: (s: SessionMeta) => void;
   /** Called when a turn ends or an approval waits while the chat is not visible. */
-  onAttention?: (why: "done" | "approval" | "clear") => void;
+  onAttention?: (why: "done" | "approval" | "clear", seconds?: number) => void;
 
   constructor(private shared: Shared, private sessionToLoad?: string, cwd?: string) {
     this.cwd = cwd ?? pickCwd(shared.tracker);
@@ -313,7 +313,7 @@ export class ChatController implements vscode.Disposable {
       case "turn_end":
         this.setBusy(false);
         if (this.state) this.state.usage = e.usage;
-        this.onAttention?.("done");
+        this.onAttention?.("done", e.stats?.seconds);
         break;
       case "compact_end":
         this.setBusy(false);
@@ -872,6 +872,8 @@ export class ChatController implements vscode.Disposable {
           " Answering “don't ask again” to a command or site adds one; edit the file to add or remove rules " +
           "(`deny` rules block even in auto mode)." + (r.sandbox ? " " + r.sandbox[0].toUpperCase() + r.sandbox.slice(1) + "." : ""));
       }
+      case "remember":
+        return this.remember(arg);
       case "rewind": {
         const t = await c.call("transcript", {}, 10000);
         const users = (t.transcript as TranscriptItem[]).filter((i): i is Extract<TranscriptItem, { type: "user" }> =>
@@ -885,6 +887,29 @@ export class ChatController implements vscode.Disposable {
       default:
         return this.notice("error", `Unknown command /${name} — type /help`);
     }
+  }
+
+  /** /remember TEXT: keep it for all projects or for this one; /remember alone opens the file. */
+  private async remember(text: string) {
+    const scope = await vscode.window.showQuickPick([
+      { label: "For all my projects", description: "your own TAI.md", scope: "personal" },
+      { label: "For this project", description: "TAI.md in this folder (shared through git if you commit it)", scope: "project" },
+    ], { title: text ? `Remember: ${text.length > 60 ? text.slice(0, 59) + "…" : text}` : "Open which instructions?" });
+    if (!scope) return;
+    const r = await this.client!.call("remember", { text, scope: scope.scope, create: !text }, 10000);
+    if (!text) {
+      await vscode.window.showTextDocument(vscode.Uri.file(r.path), { preview: false });
+      return this.notice("info", "tai reads these instructions at the start of every conversation" +
+        (scope.scope === "project" ? " in this folder." : "."));
+    }
+    return this.notice("info", `Remembered in ${relPath(this.cwd, r.path)}` + (scope.scope === "personal" ? " (for all your projects)." : "."));
+  }
+
+  /** A desktop notification through tai (for when VS Code is not in front). */
+  async desktopNotify(text: string): Promise<void> {
+    try {
+      await this.client?.call("notify", { title: "tai", text }, 5000);
+    } catch { /* no notification */ }
   }
 
   async dispose(): Promise<void> {

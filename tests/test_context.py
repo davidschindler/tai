@@ -18,7 +18,7 @@ def tai_system_prompt():
     return mod.system_prompt(True, ide=True)
 
 
-PAD = "lorem ipsum dolor sit amet\n" * 310     # 8370 characters ≈ 2100 tokens
+PAD = "lorem ipsum dolor sit amet\n" * 290     # 7830 characters ≈ 1960 tokens
 
 
 def init(c, **p):
@@ -60,7 +60,7 @@ def test_compacts_before_a_message_when_nearly_full(client, api):
 def test_compacts_in_the_middle_of_a_task(client, api):
     c = client()
     init(c, mode="auto")
-    (c.ws / "big.txt").write_text("lorem ipsum dolor sit amet\n" * 230)   # with line numbers ≈ 1900 tokens
+    (c.ws / "big.txt").write_text("lorem ipsum dolor sit amet\n" * 215)   # with line numbers ≈ 1780 tokens
     _, end, _ = c.send(mock({"text": "warm up"}))
     reset_log(api)
     m = c.mark()

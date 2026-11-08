@@ -262,6 +262,45 @@ describe("webview", { concurrency: false }, () => {
     await h.page.waitForFunction(() => document.getElementById("modeBtn").textContent === "⏵ accept edits");
     await h.page.click("#modeBtn");
     await h.page.waitForFunction(() => document.getElementById("modeBtn").textContent === "⏵⏵ auto");
+    await h.page.click("#modeBtn");
+    await h.page.waitForFunction(() => document.getElementById("modeBtn").textContent === "◇ plan");
+    await h.page.click("#modeBtn");
+    await h.page.waitForFunction(() => document.getElementById("modeBtn").textContent === "⏸ manual");
+    await done(h);
+  });
+
+  it("plan mode: shows the plan to approve, then tai carries it out", async () => {
+    const h = await harness({ mode: "plan" });
+    await h.page.waitForFunction(() => document.getElementById("modeBtn").textContent === "◇ plan");
+    const plan = "## Plan\n1. Add `notes.md`\n2. **Check** it";
+    await h.sendText(mock({ tools: [{ name: "present_plan", args: { plan } }] },
+      { tools: [{ name: "write_file", args: { path: "notes.md", content: "# notes\n" } }] }, { text: "Done." }));
+    await h.waitSel(".approval .approval-plan");
+    assert.equal((await h.text(".approval-title"))[0], "Plan");
+    assert.deepEqual(await h.text(".approval-plan li"), ["Add notes.md", "Check it"]);
+    assert.deepEqual(await h.text(".approval .opt"), ["1 Yes, start (file edits and commands still ask)",
+      "2 Yes, and let file edits run without asking", "3 No, keep planning, and tell tai what to change"]);
+    await h.shot(SHOTS, "14-plan");
+    await h.page.keyboard.press("2");
+    await h.page.waitForFunction(() => document.getElementById("modeBtn").textContent === "⏵ accept edits");
+    await h.waitIdle();
+    assert.equal(fs.readFileSync(path.join(h.ws, "notes.md"), "utf8"), "# notes\n");
+    assert.match((await h.text(".tool-summary")).join(" | "), /Plan approved · accept-edits/);
+    await done(h);
+  });
+
+  it("plan mode: feedback on the plan keeps planning", async () => {
+    const h = await harness({ mode: "plan" });
+    await h.sendText(mock({ tools: [{ name: "present_plan", args: { plan: "1. Delete everything" } }] }, { text: "Revised." }));
+    await h.waitSel(".approval .approval-plan");
+    await h.page.keyboard.press("3");
+    await h.waitSel(".feedback:not([hidden]) input");
+    assert.match(await h.page.$eval(".feedback input", (i) => i.placeholder), /change in the plan/);
+    await h.page.keyboard.type("keep the data");
+    await h.page.keyboard.press("Enter");
+    await h.waitIdle();
+    assert.match((await h.text(".tool-summary")).join(" | "), /Plan not approved — keep the data/);
+    assert.equal(await h.page.$eval("#modeBtn", (b) => b.textContent), "◇ plan");
     await done(h);
   });
 

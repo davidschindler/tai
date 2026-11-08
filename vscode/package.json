@@ -307,15 +307,22 @@
           "enum": [
             "manual",
             "accept-edits",
-            "auto"
+            "auto",
+            "plan"
           ],
           "enumDescriptions": [
             "Ask before file edits, commands and web fetches",
             "File edits run without asking; commands and fetches ask",
-            "Edits, commands and fetches run without asking (secret files still ask)"
+            "Edits, commands and fetches run without asking (secret files still ask)",
+            "tai reads and makes a plan; nothing changes until you approve the plan"
           ],
           "default": "manual",
           "description": "Permission mode for new conversations."
+        },
+        "tai.notifications": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Tell you when tai has finished a longer task or waits for your approval while the chat is hidden or VS Code is in the background (a desktop notification then)."
         },
         "tai.environmentVariables": {
           "type": "object",

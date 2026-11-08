@@ -284,6 +284,22 @@ describe("tai extension", function () {
     assert.strictEqual(ext.sidebar.state.mode, "manual");
   });
 
+  it("/remember keeps an instruction for all projects (quick pick)", async () => {
+    let settled = false;
+    const m = probe.mark();
+    const p = (ext.sidebar as any).command("remember", "Prefer short answers.").finally(() => { settled = true; });
+    await until(async () => {
+      await vscode.commands.executeCommand("workbench.action.acceptSelectedQuickOpenItem");
+      await sleep(300);
+      return settled;
+    }, 15000, "remember quick pick");
+    await p;
+    const n = probe.since(m, "notice").map((x: any) => x.text).join(" | ");
+    assert.match(n, /Remembered in .*TAI\.md \(for all your projects\)/);
+    const file = vscode.workspace.getConfiguration("tai").get<any>("environmentVariables").XDG_STATE_HOME;
+    assert.match(fs.readFileSync(path.join(file, "tai", "TAI.md"), "utf8"), /- Prefer short answers\.\n$/);
+  });
+
   it("picks a model from the quick pick", async () => {
     const p = ext.sidebar.pickModel();
     await sleep(1500);

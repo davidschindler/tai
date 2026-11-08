@@ -199,6 +199,9 @@ pre.cmd { font-weight: 600; }
 .pill:hover { color: var(--fg); border-color: var(--fg); }
 .pill.mode-accept-edits { color: var(--blue); border-color: var(--blue); }
 .pill.mode-auto { color: #d0605a; border-color: #d0605a; }
+.pill.mode-plan { color: #4fa88a; border-color: #4fa88a; }
+.approval-plan { max-height: 45vh; overflow-y: auto; margin: .3em 0 .5em; padding: .4em .6em;
+  border-left: 2px solid #4fa88a; background: var(--vscode-textBlockQuote-background, transparent); }
 .iconbtn { display: inline-flex; align-items: center; justify-content: center; border: none; background: none; padding: 3px; border-radius: 4px; color: var(--dim); }
 .iconbtn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.2)); color: var(--fg); }
 .sendbtn { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border: none; border-radius: 6px; background: var(--gold); color: #fff; }

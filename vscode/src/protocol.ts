@@ -1,6 +1,6 @@
 // Types shared by the extension host and the webview (no runtime code here).
 
-export type Mode = "manual" | "accept-edits" | "auto";
+export type Mode = "manual" | "accept-edits" | "auto" | "plan";
 
 export interface SessionMeta {
   id: string;
@@ -89,9 +89,11 @@ export interface ApprovalParams {
   title: string;
   question: string;
   always: string;
+  labels?: [string, string, string];   // the three answers, when not the usual ones (plan mode)
   agent: string;
   detail: {
-    type?: "edit" | "bash" | "fetch" | "read";
+    type?: "edit" | "bash" | "fetch" | "read" | "plan";
+    plan?: string;
     shell?: string;               // "Bash" or "PowerShell"
     path?: string;
     old?: string | null;

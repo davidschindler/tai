@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+
+const NOTIFY_AFTER_SECONDS = 20;     // shorter turns finish while you watch
 import { promptForApiKey } from "./apiKey";
 import { ChatController, config, mentionFor, Shared } from "./chatController";
 import { DiffManager } from "./diffs";
@@ -71,9 +73,10 @@ class Extension implements vscode.Disposable {
       };
     }
     const c = this.sidebar;
-    c.onAttention = (why) => {
-      if (why === "clear" || view.visible) return;
-      view.badge = { value: 1, tooltip: why === "approval" ? "tai is waiting for your approval" : "tai has finished" };
+    c.onAttention = (why, seconds) => {
+      if (why === "clear") return;
+      if (!view.visible) view.badge = { value: 1, tooltip: why === "approval" ? "tai is waiting for your approval" : "tai has finished" };
+      if (!view.visible || !vscode.window.state.focused) this.notify(c, why, seconds, () => view.show(false));
     };
     view.onDidChangeVisibility(() => {
       if (view.visible) view.badge = undefined;
@@ -97,6 +100,20 @@ class Extension implements vscode.Disposable {
     return this.sidebar!;
   }
 
+  /** A notification when tai finished a longer task, or waits for an approval, out of sight;
+   *  a desktop notification as well when VS Code is in the background. */
+  private lastNotified = new WeakMap<ChatController, number>();
+  private notify(c: ChatController, why: "done" | "approval", seconds: number | undefined, reveal: () => void) {
+    if (!config().get<boolean>("notifications", true)) return;
+    if (why === "done" && (seconds ?? 0) < NOTIFY_AFTER_SECONDS) return;
+    const now = Date.now();
+    if (why === "approval" && now - (this.lastNotified.get(c) ?? 0) < 15000) return;
+    this.lastNotified.set(c, now);
+    const text = why === "approval" ? "tai is waiting for your approval" : "tai has finished";
+    if (!vscode.window.state.focused) void c.desktopNotify(vscode.workspace.name ? `${text} · ${vscode.workspace.name}` : text);
+    void vscode.window.showInformationMessage(text, "Show").then((a) => { if (a) reveal(); });
+  }
+
   // ---------------------------------------------------------------- editor tabs
   openPanel(sessionId?: string, existing?: vscode.WebviewPanel): ChatController {
     const panel = existing ?? vscode.window.createWebviewPanel(PANEL_TYPE, "tai", vscode.ViewColumn.Beside, {
@@ -108,9 +125,10 @@ class Extension implements vscode.Disposable {
     c.onSession = (s) => {
       panel.title = s.title ? `tai · ${s.title.length > 30 ? s.title.slice(0, 29) + "…" : s.title}` : "tai";
     };
-    c.onAttention = (why) => {
-      if (why === "clear" || panel.active) return;
-      panel.title = panel.title.startsWith("● ") ? panel.title : "● " + panel.title;
+    c.onAttention = (why, seconds) => {
+      if (why === "clear") return;
+      if (!panel.active) panel.title = panel.title.startsWith("● ") ? panel.title : "● " + panel.title;
+      if (!panel.visible || !vscode.window.state.focused) this.notify(c, why, seconds, () => panel.reveal());
     };
     panel.onDidChangeViewState(() => {
       if (panel.active && panel.title.startsWith("● ")) panel.title = panel.title.slice(2);
