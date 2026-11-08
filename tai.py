@@ -4193,7 +4193,8 @@ def _repl_line(text, conv, perms, markdown, pending, start):
             msgs = conv["messages"]
             if msgs and msgs[0].get("role") == "system":
                 msgs[0] = {"role": "system", "content": system_prompt(conv["tools"], conv.get("extra_system"))}
-            dim(f"  remembered in {show_path(path)}" + ("" if project else " (for all your projects)"))
+            dim(("  remembered for this project" if project else "  remembered for all your projects")
+                + f" (in {show_path(path)})")
         elif cmd == "/permissions":
             lines = SETTINGS.describe()
             dim(f"mode: {perms.mode} — {mode_info()[perms.mode]}")

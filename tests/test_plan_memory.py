@@ -156,7 +156,7 @@ def test_remember_in_the_terminal(api, tmp_path):
     p.expect("for all your projects")
     p.expect("❯ ")
     p.sendline("/remember project Run make test after changes.")
-    p.expect("remembered in TAI.md")
+    p.expect("remembered for this project")
     p.expect("❯ ")
     p.sendline("/remember")
     p.expect("Always answer in English")
